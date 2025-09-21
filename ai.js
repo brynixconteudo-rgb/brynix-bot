@@ -14,10 +14,10 @@ const openai = new OpenAI({
 
 // URLs do site para compor o "mini-KB" (ajuste para seu domínio real!)
 const BRYNIX_PAGES = [
-  'https://www.brynix.com/',          // home
-  'https://www.brynix.com/ofertas',   // ofertas/serviços
-  'https://www.brynix.com/metodologia',
-  'https://www.brynix.com/blog',      // notícias/artigos
+  'https://brynix.ai/',          // home
+  'https://brynix.ai/ofertas',   // ofertas/serviços
+  'https://brynix.ai/sobre-a-brynix',
+  'https://brynix.ai/notícias',      // notícias/artigos
 ];
 
 // TTL do KB em memória (a cada 6h refaz o crawl/sumário)
