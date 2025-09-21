@@ -1,7 +1,6 @@
 // whatsapp.js
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { generateReply } = require('./ai');
-const gp = require('./gp'); // <— importa como objeto, para usar gp.appendLog
 
 // =====================
 // Configurações
@@ -14,6 +13,10 @@ let currentState = 'starting';
 let lastQr = '';
 let reinitNotBefore = 0;
 let client;
+
+// Logs em memória por chat (curto, suficiente p/ summary leve)
+const chatLogs = new Map(); // chatId -> [{type, text, ts}]
+const chatMeta = new Map(); // chatId -> { projectName, milestones: [] }
 
 // =====================
 // Utilitários
@@ -45,8 +48,21 @@ async function sendAlert(payload) {
   }
 }
 
+function appendLog(chatId, entry) {
+  const arr = chatLogs.get(chatId) || [];
+  arr.push({ ...entry, ts: Date.now() });
+  // mantém no máx 200 itens por chat (leve)
+  if (arr.length > 200) arr.shift();
+  chatLogs.set(chatId, arr);
+}
+
+function lastEntries(chatId, n = 30) {
+  const arr = chatLogs.get(chatId) || [];
+  return arr.slice(-n);
+}
+
 // =====================
-// Construção do cliente
+// Cliente WhatsApp
 // =====================
 function buildClient() {
   return new Client({
@@ -94,6 +110,121 @@ async function safeReinit(reason = 'unknown') {
   client.initialize();
 }
 
+function helpCard() {
+  return (
+`*Comandos*  
+• */setup* – definir nome do projeto e marcos  
+• */summary* – sumário do período (com base no que foi registrado)  
+• */note <texto>* – registrar nota rápida  
+• */doc <descrição>* – registrar documento (meta)  
+• */remind <hora> <texto>* – lembrete rápido (ack)
+
+Dica: também aceito “help”, “menu”, “o que você faz?”.  
+Quando não usar comandos, respondo normalmente com IA.`
+  );
+}
+
+async function handleSummary(chatId, msg) {
+  const meta = chatMeta.get(chatId) || {};
+  const entries = lastEntries(chatId, 40);
+
+  if (!entries.length) {
+    return 'Não tenho eventos suficientes para resumir ainda. Use */note*, */doc* e depois chame */summary*.';
+  }
+
+  // Monta um prompt curtinho para a IA resumir os eventos
+  const bullets = entries.map(e => {
+    const dt = new Date(e.ts).toLocaleString('pt-BR');
+    return `- [${dt}] ${e.type.toUpperCase()}: ${e.text}`;
+  }).join('\n');
+
+  const context = [
+    meta.projectName ? `Projeto: ${meta.projectName}` : null,
+    meta.milestones?.length ? `Marcos: ${meta.milestones.join(', ')}` : null,
+  ].filter(Boolean).join('\n');
+
+  const ask = `Resuma de forma executiva os itens abaixo (máx 6 bullets) e traga próximos passos claros. 
+Se fizer sentido, inclua % de avanço *somente* se houver evidência no texto.  
+${context ? `\n${context}\n` : ''}
+
+Itens:
+${bullets}`;
+
+  const out = await generateReply(ask, { from: chatId });
+  return out;
+}
+
+// Comandos naturais (sem barra) que disparam o help
+function looksLikeHelp(s) {
+  const t = s.toLowerCase();
+  return (
+    t === 'help' ||
+    t === 'menu' ||
+    t.includes('o que você faz') ||
+    t.includes('o que vc faz') ||
+    t.includes('comandos')
+  );
+}
+
+// Roteador de comandos (retorna string de resposta ou null)
+async function commandRouter(chatId, body) {
+  const text = (body || '').trim();
+  const lower = text.toLowerCase();
+
+  if (looksLikeHelp(lower) || lower.startsWith('/help')) {
+    return helpCard();
+  }
+
+  if (lower.startsWith('/setup')) {
+    // /setup Nome do Projeto | marco1 ; marco2 ; marco3
+    const raw = text.slice(6).trim();
+    const [pNamePart, milestonesPart] = raw.split('|').map(s => (s || '').trim());
+    const meta = chatMeta.get(chatId) || { projectName: '', milestones: [] };
+    if (pNamePart) meta.projectName = pNamePart;
+    if (milestonesPart) {
+      meta.milestones = milestonesPart
+        .split(/;|,/)
+        .map(s => s.trim())
+        .filter(Boolean);
+    }
+    chatMeta.set(chatId, meta);
+
+    return `Configuração ok ✅ 
+*Projeto:* ${meta.projectName || '—'}
+*Marcos:* ${meta.milestones?.length ? meta.milestones.join(', ') : '—'}
+
+Use */note* e */doc* para registrar fatos; depois */summary* faz um resumo executivo.`;
+  }
+
+  if (lower.startsWith('/note')) {
+    const content = text.slice(5).trim();
+    if (!content) return 'Use */note <texto>* para registrar uma nota.';
+    appendLog(chatId, { type: 'note', text: content });
+    return 'Nota registrada 📝';
+  }
+
+  if (lower.startsWith('/doc')) {
+    const content = text.slice(4).trim();
+    if (!content) return 'Use */doc <descrição>* para registrar um documento (meta).';
+    appendLog(chatId, { type: 'doc', text: content });
+    return 'Documento registrado 📎 (meta).';
+  }
+
+  if (lower.startsWith('/summary')) {
+    return await handleSummary(chatId, text);
+  }
+
+  if (lower.startsWith('/remind')) {
+    // Stub: apenas registra para compor o summary (sem agendar real)
+    const content = text.slice(7).trim();
+    appendLog(chatId, { type: 'remind', text: content || '(lembrete)' });
+    return 'Lembrete anotado ⏰ (ack).';
+  }
+
+  // não é comando
+  return null;
+}
+
 function wireEvents(c) {
   c.on('qr', (qr) => {
     lastQr = qr;
@@ -102,9 +233,7 @@ function wireEvents(c) {
     sendAlert('🔄 BOT Brynix requer novo pareamento: abra /wa-qr e escaneie o código.');
   });
 
-  c.on('authenticated', () => {
-    console.log('[WA] Autenticado');
-  });
+  c.on('authenticated', () => console.log('[WA] Autenticado'));
 
   c.on('auth_failure', (m) => {
     console.error('[WA] Falha de autenticação:', m);
@@ -123,10 +252,6 @@ function wireEvents(c) {
     console.log('[WA] Estado alterado:', currentState);
   });
 
-  c.on('loading_screen', (percent, message) => {
-    console.log(`[WA] loading_screen: ${percent}% - ${message}`);
-  });
-
   c.on('disconnected', (reason) => {
     currentState = 'disconnected';
     console.error('[WA] Desconectado:', reason);
@@ -134,69 +259,41 @@ function wireEvents(c) {
     safeReinit(`disconnected:${reason || 'unknown'}`);
   });
 
-  // ============ Mensagens ============
+  // Mensagens (grupos e 1:1)
   c.on('message', async (msg) => {
     try {
-      // ignora as mensagens do próprio bot
-      if (msg.fromMe) return;
+      const chat = await msg.getChat();
+      const chatId = chat.id._serialized;
+      const text = (msg.body || '').trim();
 
-      const isGroup = msg.from?.endsWith('@g.us');
-      const groupId = isGroup ? msg.from : null;
-
-      // Em grupo, o autor vem em msg.author (ex.: 55xxxx@s.whatsapp.net)
-      const authorId = isGroup
-        ? (msg.author || msg._data?.author || '')
-        : msg.from;
-
-      const authorName =
-        msg._data?.notifyName ||
-        msg._data?.pushname ||
-        msg._data?.sender?.pushname ||
-        authorId;
-
-      const body = (msg.body || '').trim();
-      console.log(`[WA] Mensagem ${isGroup ? 'GRUPO' : 'DM'} de ${authorName}: "${body}"`);
-
-      // 1) Log leve de mensagens de GRUPO (não falhar caso inexista)
-      if (isGroup && gp && typeof gp.appendLog === 'function') {
-        try {
-          gp.appendLog(groupId, {
-            author: authorName,
-            authorId,
-            body,
-          });
-        } catch (e) {
-          console.error('[WA] Falha appendLog:', e?.message || e);
-        }
-      }
-
-      // 2) Comandos simples (ex.: /help). Opcional: só em grupo.
-      if (body.startsWith('/help')) {
-        const menu =
-          '*Comandos*\n' +
-          '• /setup – definir nome do projeto e marcos\n' +
-          '• /summary – sumário do período\n' +
-          '• /note <texto> – registrar nota\n' +
-          '• /doc <descrição> – registrar documento (meta)\n' +
-          '• /remind <hora> <texto> – lembrete rápido\n';
-        await msg.reply(menu);
+      // 1) roteia comandos (com ou sem barra help/menu)
+      const routed = await commandRouter(chatId, text);
+      if (routed) {
+        await msg.reply(routed);
+        // loga o “evento” para ajudar no summary
+        appendLog(chatId, { type: 'cmd', text });
         return;
       }
 
-      // 3) IA (resposta normal em DM e grupo)
-      const reply = await generateReply(body, {
-        from: isGroup ? `${groupId}:${authorId}` : msg.from,
-        pushName: authorName,
-        isGroup,
+      // 2) se não for comando e a mensagem for “ajuda natural”
+      if (looksLikeHelp(text)) {
+        await msg.reply(helpCard());
+        appendLog(chatId, { type: 'cmd', text: '/help (natural)' });
+        return;
+      }
+
+      // 3) fluxo normal -> IA
+      appendLog(chatId, { type: 'msg', text });
+      const reply = await generateReply(text, {
+        from: msg.from,
+        pushName: msg._data?.notifyName,
       });
 
       await msg.reply(reply);
-      console.log(`[WA] Resposta enviada para ${isGroup ? groupId : msg.from}.`);
+      appendLog(chatId, { type: 'ia', text: reply });
     } catch (err) {
       console.error('[WA] Erro ao processar mensagem:', err);
-      try {
-        await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?');
-      } catch (_) {}
+      try { await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?'); } catch (_) {}
     }
   });
 }
@@ -214,21 +311,8 @@ function initWhatsApp(app) {
       try {
         const s = await client.getState().catch(() => null);
         if (s) state = s;
-      } catch {}
+      } catch (_) {}
       res.json({ status: state });
-    });
-
-    app.get('/wa-qr', async (_req, res) => {
-      try {
-        const qr = getLastQr();
-        if (!qr) return res.status(503).send('QR ainda não gerado.');
-        const QRCode = require('qrcode');
-        const png = await QRCode.toBuffer(qr, { type: 'png', margin: 1, scale: 6 });
-        res.type('image/png').send(png);
-      } catch (e) {
-        console.error('[WA] Erro ao gerar QR:', e);
-        res.status(500).send('Erro ao gerar QR');
-      }
     });
   }
 
@@ -243,6 +327,7 @@ function initWhatsApp(app) {
         safeReinit(`watchdog:${s || 'null'}`);
       } else if (currentState !== 'ready' && s === 'CONNECTED') {
         currentState = 'ready';
+        console.log('[WA] Estado ok (CONNECTED)');
       } else {
         console.log(`[WA] Estado ok (${s || currentState})`);
       }
