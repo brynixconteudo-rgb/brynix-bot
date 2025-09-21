@@ -1,30 +1,56 @@
 // whatsapp.js
+const fs = require('fs');
+const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { generateReply } = require('./ai');
 
 // =====================
 // Configurações
 // =====================
-// ⚠️ Por padrão, usa caminho local para não quebrar em Free.
-// Quando você criar o Disk no Render, defina WA_SESSION_PATH=/var/data/wa-session.
-const SESSION_PATH = process.env.WA_SESSION_PATH || './wa-session';
-
-const REINIT_COOLDOWN_MS = 30_000;       // não tentar reiniciar +1x a cada 30s
+const SESSION_PATH = process.env.WA_SESSION_PATH || '/var/data/wa-session';
+const REINIT_COOLDOWN_MS = 30_000;       // não tentar reiniciar mais de 1x a cada 30s
 const WATCHDOG_INTERVAL_MS = 60_000;     // verificação a cada 60s
+const DB_FILE = path.join(process.env.WA_SESSION_PATH || '/var/data', 'botdb.json');
 
 let currentState = 'starting';
-let lastQr = '';                         // último QR (serviço /wa-qr)
+let lastQr = ''; // QR em memória (servido em /wa-qr)
 let reinitNotBefore = 0;
 let client;
 
 // =====================
-// Utilitários
+// “Banco” simples por grupo (persistido)
 // =====================
-function getLastQr() {
-  return lastQr;
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+    }
+  } catch {}
+  return { chats: {} }; // { chats: { [chatId]: { mode: 'concierge'|'project', memory: [] } } }
+}
+function saveDB(db) {
+  try {
+    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+  } catch (e) {
+    console.error('[DB] Falha ao salvar DB:', e);
+  }
+}
+const db = loadDB();
+
+function getChatConfig(chatId) {
+  db.chats[chatId] ??= { mode: 'concierge', memory: [] };
+  return db.chats[chatId];
+}
+function setChatMode(chatId, mode) {
+  const cfg = getChatConfig(chatId);
+  cfg.mode = mode;
+  saveDB(db);
 }
 
-/** Envia alerta (Zapier/Webhook) se configurado via ALERT_WEBHOOK_URL */
+// =====================
+// Webhook de alerta (Zapier) opcional
+// =====================
 async function sendAlert(payload) {
   const url = process.env.ALERT_WEBHOOK_URL;
   if (!url) {
@@ -49,13 +75,13 @@ async function sendAlert(payload) {
 }
 
 // =====================
-// Construção do cliente
+// Client builder e ciclo de vida
 // =====================
 function buildClient() {
   return new Client({
     authStrategy: new LocalAuth({
       clientId: 'brynix-bot',
-      dataPath: SESSION_PATH,          // ← aqui está o caminho “fallback”
+      dataPath: SESSION_PATH,
     }),
     puppeteer: {
       headless: true,
@@ -75,7 +101,6 @@ function buildClient() {
   });
 }
 
-/** Reinicializa o client com “cooldown” para evitar loops */
 async function safeReinit(reason = 'unknown') {
   const now = Date.now();
   if (now < reinitNotBefore) {
@@ -87,7 +112,7 @@ async function safeReinit(reason = 'unknown') {
   try {
     console.log(`[WA] Reinicializando cliente. Motivo: ${reason}`);
     if (client) {
-      try { await client.destroy(); } catch (_) {}
+      try { await client.destroy(); } catch {}
     }
   } catch (err) {
     console.error('[WA] Erro ao destruir cliente:', err);
@@ -96,6 +121,17 @@ async function safeReinit(reason = 'unknown') {
   client = buildClient();
   wireEvents(client);
   client.initialize();
+}
+
+function shouldRespondInGroup(text, msg, myId) {
+  const t = (text || '').toLowerCase().trim();
+  // 1) menção direta ao bot?
+  if (msg.mentionedIds && msg.mentionedIds.includes(myId)) return true;
+  // 2) prefixo bot:
+  if (t.startsWith('bot:') || t.startsWith('@bot')) return true;
+  // 3) palavras-chave leves
+  const keys = ['@brynix', 'brynix', 'assistente', 'bot'];
+  return keys.some(k => t.includes(k));
 }
 
 function wireEvents(c) {
@@ -138,40 +174,85 @@ function wireEvents(c) {
     safeReinit(`disconnected:${reason || 'unknown'}`);
   });
 
-  // Mensagens (IA)
+  // ============ Mensagens ============
   c.on('message', async (msg) => {
     try {
-      console.log(`[WA] Mensagem recebida de ${msg.from}: "${msg.body}"`);
+      const chat = await msg.getChat();
+      const contact = await msg.getContact();
+      const text = msg.body || '';
+      const isGroup = chat.isGroup;
 
-      const reply = await generateReply(msg.body, {
+      // Só fala em grupo quando chamado
+      if (isGroup) {
+        const me = await c.getNumberId(contact.number).catch(() => null);
+        // melhor forma de pegar o ID do bot:
+        const meId = c.info?.wid?._serialized;
+
+        if (!shouldRespondInGroup(text, msg, meId)) {
+          return; // silencioso
+        }
+      }
+
+      // Comandos de modo (só em grupo)
+      if (isGroup) {
+        const lower = text.toLowerCase().trim();
+        if (lower.includes('/mode project')) {
+          setChatMode(chat.id._serialized, 'project');
+          await msg.reply('Modo **PROJETO** ativado para este grupo ✅');
+          return;
+        }
+        if (lower.includes('/mode concierge')) {
+          setChatMode(chat.id._serialized, 'concierge');
+          await msg.reply('Modo **CONCIERGE** (padrão) ativado para este grupo ✅');
+          return;
+        }
+      }
+
+      // Persona por chat
+      const chatId = chat.id._serialized;
+      const { mode } = getChatConfig(chatId);
+      console.log(`[WA] (${isGroup ? 'GROUP' : '1:1'}) ${chatId} | mode=${mode} | from=${msg.from} | "${text}"`);
+
+      // Chama a IA com persona dinâmica
+      const reply = await generateReply(text, {
         from: msg.from,
         pushName: msg._data?.notifyName,
+        isGroup,
+        mode, // 'concierge' | 'project'
+        chatTitle: isGroup ? chat.name : undefined,
       });
 
       await msg.reply(reply);
       console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${reply}"`);
     } catch (err) {
       console.error('[WA] Erro ao processar/enviar resposta (IA):', err);
-      try { await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?'); } catch(_) {}
+      try {
+        await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?');
+      } catch {}
       sendAlert(`❗ Erro ao responder mensagem: ${err?.message || err}`);
     }
   });
 }
 
 // =====================
-// Inicialização pública
+// API pública para server.js
 // =====================
+function getLastQr() {
+  return lastQr;
+}
+
 function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
 
+  // Health
   if (app && app.get) {
     app.get('/wa-status', async (_req, res) => {
       let state = currentState;
       try {
         const s = await client.getState().catch(() => null);
         if (s) state = s;
-      } catch (_) {}
+      } catch {}
       res.json({ status: state });
     });
   }
