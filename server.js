@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const QRCode = require('qrcode');
 
 const { initWhatsApp, getLastQr } = require('./whatsapp');
+const { refreshKB } = require('./ai');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -14,7 +15,7 @@ app.get('/', (_req, res) => {
   res.send('BRYNIX WhatsApp Bot up ✅');
 });
 
-// Rota para visualizar o QR (PNG)
+// QR como PNG
 app.get('/wa-qr', async (_req, res) => {
   try {
     const qr = getLastQr();
@@ -31,7 +32,18 @@ app.get('/wa-qr', async (_req, res) => {
   }
 });
 
-// Inicializa o cliente do WhatsApp (vai logar eventos no Render)
+// Força atualização do mini-KB (site da BRYNIX)
+app.post('/kb-refresh', async (_req, res) => {
+  try {
+    const info = await refreshKB();
+    res.json({ ok: true, ...info });
+  } catch (e) {
+    console.error('[KB] refresh erro:', e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// Inicializa o cliente do WhatsApp
 initWhatsApp(app);
 
 const port = process.env.PORT || 3000;
