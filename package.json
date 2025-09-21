@@ -10,10 +10,11 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "body-parser": "^1.20.2",
-    "whatsapp-web.js": "^1.25.0",
+    "cheerio": "^1.0.0-rc.12",
+    "express": "^4.19.2",
+    "openai": "^4.55.0",
     "qrcode": "^1.5.3",
-    "openai": "^4.55.0"
+    "whatsapp-web.js": "^1.25.0"
   }
 }
