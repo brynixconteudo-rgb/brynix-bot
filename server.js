@@ -1,16 +1,40 @@
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
-const { initWhatsApp } = require('./whatsapp'); // IMPORTA O MÓDULO
+const QRCode = require('qrcode');
+
+const { initWhatsApp, getLastQr } = require('./whatsapp');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Rota de teste
-app.get('/', (_req, res) => res.send('BRYNIX WhatsApp Bot up ✅'));
+// Health
+app.get('/', (_req, res) => {
+  res.send('BRYNIX WhatsApp Bot up ✅');
+});
 
-// REGISTRA AS ROTAS DO WHATSAPP
+// Rota para visualizar o QR (PNG)
+app.get('/wa-qr', async (_req, res) => {
+  try {
+    const qr = getLastQr();
+    if (!qr) {
+      return res
+        .status(503)
+        .send('QR ainda não gerado. Aguarde alguns segundos e atualize a página.');
+    }
+    const png = await QRCode.toBuffer(qr, { type: 'png', margin: 1, scale: 6 });
+    res.type('image/png').send(png);
+  } catch (e) {
+    console.error('[WA] Erro ao gerar QR:', e);
+    res.status(500).send('Erro ao gerar QR');
+  }
+});
+
+// Inicializa o cliente do WhatsApp (vai logar eventos no Render)
 initWhatsApp(app);
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Servidor rodando na porta ${port}`));
+app.listen(port, () => {
+  console.log(`Servidor rodando na porta ${port}`);
+});
