@@ -5,12 +5,15 @@ const { generateReply } = require('./ai');
 // =====================
 // Configurações
 // =====================
-const SESSION_PATH = process.env.WA_SESSION_PATH || '/var/data/wa-session';
-const REINIT_COOLDOWN_MS = 30_000; // não tentar reiniciar mais de 1x a cada 30s
-const WATCHDOG_INTERVAL_MS = 60_000; // verificação a cada 60s
+// ⚠️ Por padrão, usa caminho local para não quebrar em Free.
+// Quando você criar o Disk no Render, defina WA_SESSION_PATH=/var/data/wa-session.
+const SESSION_PATH = process.env.WA_SESSION_PATH || './wa-session';
+
+const REINIT_COOLDOWN_MS = 30_000;       // não tentar reiniciar +1x a cada 30s
+const WATCHDOG_INTERVAL_MS = 60_000;     // verificação a cada 60s
 
 let currentState = 'starting';
-let lastQr = ''; // mantém o último QR gerado em memória (servido por /wa-qr)
+let lastQr = '';                         // último QR (serviço /wa-qr)
 let reinitNotBefore = 0;
 let client;
 
@@ -52,8 +55,7 @@ function buildClient() {
   return new Client({
     authStrategy: new LocalAuth({
       clientId: 'brynix-bot',
-      // caminho persistente (Render Disk)
-      dataPath: SESSION_PATH,
+      dataPath: SESSION_PATH,          // ← aqui está o caminho “fallback”
     }),
     puppeteer: {
       headless: true,
@@ -85,7 +87,6 @@ async function safeReinit(reason = 'unknown') {
   try {
     console.log(`[WA] Reinicializando cliente. Motivo: ${reason}`);
     if (client) {
-      // destruir silenciosamente (pode lançar)
       try { await client.destroy(); } catch (_) {}
     }
   } catch (err) {
@@ -126,7 +127,6 @@ function wireEvents(c) {
     console.log('[WA] Estado alterado:', currentState);
   });
 
-  // alguns ambientes disparam este evento
   c.on('loading_screen', (percent, message) => {
     console.log(`[WA] loading_screen: ${percent}% - ${message}`);
   });
@@ -152,11 +152,7 @@ function wireEvents(c) {
       console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${reply}"`);
     } catch (err) {
       console.error('[WA] Erro ao processar/enviar resposta (IA):', err);
-      // falha pontual → responde “fallback” e registra
-      try {
-        await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?');
-      } catch (_) {}
-      // alerta (com parcimônia)
+      try { await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?'); } catch(_) {}
       sendAlert(`❗ Erro ao responder mensagem: ${err?.message || err}`);
     }
   });
@@ -169,12 +165,10 @@ function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
 
-  // Health endpoint
   if (app && app.get) {
     app.get('/wa-status', async (_req, res) => {
       let state = currentState;
       try {
-        // getState pode lançar; se vier “CONNECTED” ok
         const s = await client.getState().catch(() => null);
         if (s) state = s;
       } catch (_) {}
@@ -184,7 +178,7 @@ function initWhatsApp(app) {
 
   client.initialize();
 
-  // Watchdog: monitora e tenta recuperar
+  // Watchdog
   setInterval(async () => {
     try {
       const s = await client.getState().catch(() => null);
