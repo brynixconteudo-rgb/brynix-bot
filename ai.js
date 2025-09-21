@@ -1,101 +1,98 @@
 // ai.js
-// Integração OpenAI (CommonJS) – com geração de respostas e sumário de log.
+// Implementação robusta para OpenAI usando CommonJS e com "guarda de escopo".
+// A IA só responde dentro do tema BRYNIX; para o resto, redireciona.
 
 const OpenAI = require('openai');
-const API_KEY = process.env.OPENAI_API_KEY || '';
+const gp = require('./gp');
 
+// === Config OpenAI ===
+const API_KEY = process.env.OPENAI_API_KEY || '';
 if (!API_KEY) {
   console.error('[AI] OPENAI_API_KEY ausente nas variáveis de ambiente.');
 }
-
 const client = new OpenAI({ apiKey: API_KEY });
 
-// Modelo estável e econômico
+// Modelo (pode trocar via env AI_MODEL)
 const MODEL = (process.env.AI_MODEL || 'gpt-4o-mini').trim();
 
-// Prompt base (Assistente BRYNIX)
+// === Prompt base ===
 const SYSTEM_PROMPT = `
-Você é o **Assistente BRYNIX**.
+Você é o **Assistente BRYNIX**, com tom executivo, direto e cordial, leve humor quando apropriado.
 
-Estilo: executivo, claro, cordial, com leve humor.
-Foco: sempre responder a partir da perspectiva da BRYNIX (empresa, projetos, ofertas, automações, clientes).
-Você **não é** uma enciclopédia geral**: se receber perguntas que não tenham relação com BRYNIX, redirecione de forma educada.
+**Escopo**: BRYNIX (empresa, ofertas, automações, cases, metodologia, projetos), contexto de atendimento, agenda e follow-up.  
+NÃO é seu papel responder assuntos fora deste escopo. Quando algo estiver fora, diga educadamente:
+"Esse tema foge do meu escopo. Posso te ajudar com projetos e soluções da BRYNIX."
 
-### Diretrizes
-- Responda em PT-BR, com 2–4 parágrafos curtos ou bullets quando ajudar na clareza.
-- Se a pergunta for fora de escopo (ex.: “Guerra do Golfo”), diga algo como:
-  “Esse tema não faz parte do meu escopo. Meu papel é ajudar você com os projetos e soluções da BRYNIX.”
-- Evite respostas genéricas demais. Traga utilidade prática ligada à BRYNIX.
-- Conclua com um convite a um próximo passo (quando fizer sentido).
-`;
+**Diretrizes**:
+- Responda em PT-BR.
+- Priorize respostas objetivas (2–4 parágrafos curtos) ou bullets quando ajudar.
+- Quando possível, conclua com um convite prático (próximo passo/ação).
+- Evite generalidades. Use informações concretas quando disponíveis.
+`.trim();
 
 function buildUserPrompt(userText, ctx = {}) {
-  const name = ctx?.pushName ? `(${ctx.pushName})` : '';
+  const name = ctx?.pushName ? ` (${ctx.pushName})` : '';
   const origin = ctx?.from ? ` [origem: ${ctx.from}]` : '';
   return `Mensagem${name}${origin}: ${userText}`;
 }
 
-async function generateReply(userText, ctx = {}) {
-  try {
-    const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: buildUserPrompt(userText, ctx) },
-    ];
+// Extrai texto do Responses API (compatível)
+function extractText(resp) {
+  // v4 client.responses.create
+  if (resp?.output_text) return resp.output_text;
 
-    const resp = await client.responses.create({
+  // fallback (às vezes vem em 'content[0].text')
+  try {
+    const parts = resp?.output?.[0]?.content || resp?.content || [];
+    const textPart = parts.find(p => p.type === 'output_text' || p.type === 'text');
+    if (textPart?.text?.value) return textPart.text.value;
+    if (typeof textPart?.text === 'string') return textPart.text;
+  } catch {}
+  return '';
+}
+
+async function generateReply(userText, ctx) {
+  // 1) Tenta tratar como GP (comandos, linguagem natural)
+  try {
+    const gpRes = await gp.handleMessage(userText, ctx);
+    if (gpRes?.handled) {
+      const msg = await Promise.resolve(gpRes.reply);
+      return msg;
+    }
+  } catch (err) {
+    console.error('[AI] GP handler falhou:', err?.message || err);
+    // segue para IA mesmo assim
+  }
+
+  // 2) Fora do GP → IA responde, MAS dentro do escopo BRYNIX
+  const userPrompt = buildUserPrompt(userText, ctx);
+
+  try {
+    const response = await client.responses.create({
       model: MODEL,
-      input: messages.map(m => ({ role: m.role, content: m.content })),
-      max_output_tokens: 400,
-      temperature: 0.5,
+      input: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt }
+      ]
     });
 
-    const out = resp?.output_text?.trim();
-    return out || 'Certo! Pode me contar um pouco mais do que você precisa?';
+    let out = extractText(response) || '';
+    if (!out) out = 'Posso te ajudar com projetos e soluções da BRYNIX. Como prefere começar?';
+
+    // Hard guard: se o usuário perguntar claramente algo fora (e.g. "Guerra do Golfo"),
+    // faz o desvio elegante:
+    const lower = (userText || '').toLowerCase();
+    const outOfScope =
+      /(guerra|hist[oó]ria geral|geopol[ií]tica|celebridades|filmes|receitas|c[âa]mbio|clima|cotação|piada)/.test(lower);
+    if (outOfScope) {
+      out = 'Esse tema foge do meu escopo. Posso te ajudar com projetos e soluções da BRYNIX, como automações, diagnóstico (assessment) e delivery.';
+    }
+
+    return out;
   } catch (err) {
-    console.error('[AI] Erro generateReply:', err?.message || err);
+    console.error('[AI] Falha na chamada OpenAI:', err?.message || err);
     return 'Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?';
   }
 }
 
-// Summariza um conjunto de eventos (log leve) em status executivo.
-async function summarizeLog(events = [], projectName = 'Projeto', minutes = 1440) {
-  try {
-    const header = `Resumo das últimas ${minutes} min – ${projectName}`;
-    const bullets = events.slice(-200).map(e => {
-      const who = e.senderName || e.sender || 'alguém';
-      const kind = e.type || 'msg';
-      const txt = (e.text || e.caption || '').slice(0, 400).replace(/\s+/g, ' ').trim();
-      return `- [${e.ts}] (${who}; ${kind}) ${txt}`;
-    }).join('\n');
-
-    const prompt = `
-Você é GP da BRYNIX. Gere um status report objetivo. 
-Entrada (log enxuto):
-${bullets || '(sem eventos relevantes no período)'}
-Saída:
-- Principais avanços (bullets)
-- Pendências e riscos (bullets)
-- Próximos passos (bullets)
-- % de avanço geral (estimativa)
-- Tom curto, executivo, em PT-BR.
-`;
-
-    const resp = await client.responses.create({
-      model: MODEL,
-      input: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: prompt }
-      ],
-      max_output_tokens: 500,
-      temperature: 0.4,
-    });
-
-    const out = resp?.output_text?.trim();
-    return out || `${header}\n(não há dados suficientes para um resumo significativo)`;
-  } catch (err) {
-    console.error('[AI] Erro summarizeLog:', err?.message || err);
-    return 'Não consegui gerar o sumário agora. Tente novamente em instantes.';
-  }
-}
-
-module.exports = { generateReply, summarizeLog };
+module.exports = { generateReply };
