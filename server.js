@@ -1,37 +1,44 @@
 const express = require('express');
-const { MessagingResponse } = require('twilio').twiml;
+const bodyParser = require('body-parser');
+const twilio = require('twilio');
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(bodyParser.urlencoded({ extended: false }));
 
+// Twilio Credentials (vindos das variáveis de ambiente do Render)
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+const client = twilio(accountSid, authToken);
+
+// Rota de teste
 app.get('/', (req, res) => {
-  res.send('BRYNIX WhatsApp Bot up ✅');
+  res.send('BRYNIX WhatsApp Bot up');
 });
 
-app.post('/webhook', (req, res) => {
-  const twiml = new MessagingResponse();
-  const msg = (req.body.Body || '').trim().toLowerCase();
-  const from = req.body.ProfileName || req.body.From || 'Contato';
+// Endpoint para receber mensagens do WhatsApp
+app.post('/whatsapp', (req, res) => {
+  const incomingMsg = req.body.Body;
 
   let reply;
-
-  if (!msg) {
-    reply = `Olá, ${from}! Eu sou o bot da BRYNIX 🤖. Envie "ajuda" para ver opções.`;
-  } else if (msg.includes('ajuda')) {
-    reply = `Oi, ${from}! Posso ajudar com:\n- "status"\n- "agenda"\n- "contato"`;
-  } else if (msg.includes('status')) {
-    reply = `Status do Assessment:\nKick-off concluído ✅\nEntrevistas: agendamento pendente ⏳`;
-  } else if (msg.includes('agenda')) {
-    reply = `Agenda:\nEntrevista 1 (Estratégico): TBD\nEntrevista 2 (Gerencial): TBD\nEntrevista 3–5 (Operacional): TBD`;
-  } else if (msg.includes('contato')) {
-    reply = `Canais BRYNIX:\nEmail: contato@brynix.ai\nSite: https://brynix.ai`;
+  if (incomingMsg.toLowerCase().includes('oi')) {
+    reply = 'Olá! 👋 Aqui é o Bot da BRYNIX, pronto para ajudar.';
   } else {
-    reply = `Entendi, ${from}. Se quiser ver opções, digite "ajuda".`;
+    reply = 'Recebi sua mensagem, já já respondo com novidades 🚀';
   }
 
-  twiml.message(reply);
-  res.type('text/xml').send(twiml.toString());
+  client.messages
+    .create({
+      from: 'whatsapp:' + process.env.TWILIO_PHONE_NUMBER, // número do Twilio
+      to: 'whatsapp:+5511956847159', // 📌 seu WhatsApp Business
+      body: reply,
+    })
+    .then(message => console.log(`Mensagem enviada: ${message.sid}`))
+    .catch(err => console.error(err));
+
+  res.send('<Response></Response>');
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`BRYNIX bot listening on ${port}`));
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Servidor rodando na porta ${port}`);
+});
