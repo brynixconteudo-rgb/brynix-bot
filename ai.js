@@ -1,73 +1,67 @@
 // ai.js
+// Implementação robusta para OpenAI usando CommonJS e modelo estável por padrão.
+
 const OpenAI = require('openai');
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Prompts (personas)
-const SYSTEM_CONCIERGE = `
-Você é o *Assistente BRYNIX* para atendimentos 1:1.
-Tom: executivo, direto, humano, cordial; sem jargões desnecessários.
-Seja útil em poucas linhas. Use bullets quando facilitar.
-Se perguntarem sobre a BRYNIX: explique que é uma empresa de integração
-e otimização de processos, com diagnósticos (Assessment) e implementação
-de soluções com IA. Evite promessas; fale de valores quando perguntarem,
-de forma condicionada (depende de escopo, prazo etc.).`;
-
-const SYSTEM_PROJECT = `
-Você é o *Assistente de Projeto da BRYNIX* dentro de um grupo de WhatsApp.
-Perfil: Gerente de Projeto + Analista + Secretária.
-Tom: objetivo, prático, organizado, com leve bom humor, sem ser informal demais.
-Regras:
-- Responda sempre considerando que está em um grupo de projeto.
-- Organize a informação (bullets/steps) sem “encher linguiça”.
-- Pode cobrar prazos gentilmente, sugerir próximos passos e sintetizar.
-- Se pedirem algo que dependa de confirmação, proponha uma ação concreta.
-- Não prometa integrações automáticas que não existam ainda; sugira workaround.
-- Nunca vaze dados de outros projetos/grupos; mantenha a conversa apenas no contexto atual.
-`;
-
-function buildSystemPrompt(mode, extras = {}) {
-  const base = mode === 'project' ? SYSTEM_PROJECT : SYSTEM_CONCIERGE;
-
-  // Você pode injetar “contexto da BRYNIX” aqui se quiser (depois expandimos com o fetch do site).
-  const company = `
-Contexto BRYNIX (curto):
-- Diagnóstico (Assessment) e desenho de roadmap.
-- Implementação de automações, integrações e agentes de IA.
-- Postura: transparente, pragmática, foco em valor, sprints curtas.
-`;
-
-  const where = extras.isGroup && extras.chatTitle
-    ? `Você está respondendo no grupo "${extras.chatTitle}".`
-    : `Atendimento 1:1.`;
-
-  return `${base}\n${where}\n${company}`;
+// Lê a key do ambiente; se não existir, loga e falha claramente.
+const API_KEY = process.env.OPENAI_API_KEY || '';
+if (!API_KEY) {
+  console.error('[AI] OPENAI_API_KEY ausente nas variáveis de ambiente.');
 }
 
-async function generateReply(userText, meta = {}) {
-  const mode = meta.mode || (meta.isGroup ? 'project' : 'concierge');
+const client = new OpenAI({ apiKey: API_KEY });
 
-  const system = buildSystemPrompt(mode, meta);
-  const user = (userText || '').trim();
+// Defina o modelo por env ou use um default estável.
+// Dica: se quiser mudar, crie AI_MODEL no Render (ex.: "gpt-4o-mini").
+const MODEL = (process.env.AI_MODEL || 'gpt-4o-mini').trim();
 
-  const res = await client.responses.create({
-    model: 'gpt-5',
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user },
-    ],
-  });
+// Prompt base curto; ampliamos depois conforme as features (/setup, summary etc.)
+const SYSTEM_PROMPT = `
+Você é o Assistente BRYNIX: executivo, direto, cordial e com bom humor leve.
+- Responda em PT-BR.
+- Priorize clareza, objetividade e ação.
+- Se a pergunta for sobre a BRYNIX, fale como um representante da empresa.
+- Evite jargões desnecessários.
+`;
 
-  // compat: pegue o texto de forma estável
-  const out = res.output_text ?? (
-    res.choices?.[0]?.message?.content ??
-    res.choices?.[0]?.text ??
-    'Não consegui elaborar uma resposta agora.'
-  );
+function buildUserPrompt(userText, ctx = {}) {
+  const name = ctx?.pushName ? ` (${ctx.pushName})` : '';
+  const from  = ctx?.from ? ` [origem: ${ctx.from}]` : '';
+  return `Mensagem${name}${from}: ${userText}`;
+}
 
-  return out;
+/**
+ * Gera resposta via OpenAI.
+ * Lança erro para o caller lidar com fallback (o whatsapp.js já faz isso).
+ */
+async function generateReply(userText, ctx = {}) {
+  if (!API_KEY) throw new Error('OPENAI_API_KEY não configurada');
+
+  try {
+    // Usamos Chat Completions da API estável
+    const resp = await client.chat.completions.create({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user',   content: buildUserPrompt(userText, ctx) },
+      ],
+      temperature: 0.3,
+      max_tokens: 400,
+    });
+
+    const out = resp?.choices?.[0]?.message?.content?.trim();
+    if (!out) throw new Error('Resposta vazia da IA');
+    return out;
+  } catch (err) {
+    // Log detalhado ajuda MUITO a diagnosticar
+    console.error('[AI] Erro na chamada OpenAI:', {
+      message: err?.message,
+      status: err?.status,
+      data: err?.response?.data,
+    });
+    // Repassa para o whatsapp.js decidir o fallback
+    throw err;
+  }
 }
 
 module.exports = { generateReply };
