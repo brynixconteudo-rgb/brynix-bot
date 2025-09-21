@@ -1,17 +1,14 @@
 {
-  "name": "brynix-whatsapp-bot",
+  "name": "brynix-bot",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "twilio": "^4.22.0"
-  },
-  "description": "",
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs"
+    "express": "^4.18.2",
+    "twilio": "^4.23.0",
+    "body-parser": "^1.20.2",
+    "openai": "^4.55.0"
+  }
 }
