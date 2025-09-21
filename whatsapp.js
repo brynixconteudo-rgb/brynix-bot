@@ -2,6 +2,11 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 
 let currentState = 'starting';
+let lastQr = ''; // mantém o último QR gerado em memória
+
+function getLastQr() {
+  return lastQr;
+}
 
 function initWhatsApp(app) {
   const client = new Client({
@@ -12,10 +17,9 @@ function initWhatsApp(app) {
     },
   });
 
-  // ---------- LOGS ÚTEIS ----------
   client.on('qr', (qr) => {
-    console.log('[WA] QR gerado. Acesse /wa-qr para visualizar.');
-    // se você já tem a rota /wa-qr renderizando o QR, está ok.
+    lastQr = qr;
+    console.log('[WA] QR gerado. Abra /wa-qr para escanear.');
   });
 
   client.on('authenticated', () => {
@@ -41,7 +45,7 @@ function initWhatsApp(app) {
     console.error('[WA] Desconectado:', reason);
   });
 
-  // ---------- AQUI LOGAMOS AS MENSAGENS ----------
+  // LOGA e RESPONDE mensagens
   client.on('message', async (msg) => {
     try {
       console.log(`[WA] Mensagem recebida de ${msg.from}: "${msg.body}"`);
@@ -61,7 +65,6 @@ function initWhatsApp(app) {
     }
   });
 
-  // rota simples de status (opcional)
   if (app && app.get) {
     app.get('/wa-status', (_req, res) => {
       res.json({ status: currentState });
@@ -71,4 +74,4 @@ function initWhatsApp(app) {
   client.initialize();
 }
 
-module.exports = { initWhatsApp };
+module.exports = { initWhatsApp, getLastQr };
