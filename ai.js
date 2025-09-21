@@ -1,134 +1,101 @@
 // ai.js
-// Implementação robusta usando OpenAI v4 (Responses API) e CommonJS.
+// Integração OpenAI (CommonJS) – com geração de respostas e sumário de log.
 
 const OpenAI = require('openai');
-
 const API_KEY = process.env.OPENAI_API_KEY || '';
+
 if (!API_KEY) {
   console.error('[AI] OPENAI_API_KEY ausente nas variáveis de ambiente.');
 }
 
 const client = new OpenAI({ apiKey: API_KEY });
 
-// Altere via variável de ambiente se quiser (ex.: gpt-4o-mini, gpt-5-mini)
+// Modelo estável e econômico
 const MODEL = (process.env.AI_MODEL || 'gpt-4o-mini').trim();
 
-/**
- * Conhecimento base mínimo sobre a BRYNIX (EDITÁVEL).
- * Se quiser mover para um arquivo .md ou para env, fique à vontade.
- */
-const BRYNIX_KB = `
-BRYNIX: consultoria focada em análise de projetos e automações inteligentes (IA + integrações).
-Áreas principais:
-- Assessment de processos (diagnóstico inicial, mapeamento de riscos, backlog de melhorias).
-- Automação operacional (n8n/Make/Zapier), bots conversacionais, extração e enriquecimento de dados.
-- Integrações com GSuite/Drive/Sheets, WhatsApp, Jira, CRMs e serviços internos.
-- Roadmaps executivos com entregas incrementais (semanas, não meses).
-Estilo de comunicação BRYNIX: executivo, direto, cordial, com leve humor e foco em próximos passos.
-`;
-
-/**
- * Prompt de sistema: define identidade, tom e limites.
- * Mantém o foco em BRYNIX e redireciona assuntos “fora de escopo”.
- */
+// Prompt base (Assistente BRYNIX)
 const SYSTEM_PROMPT = `
 Você é o **Assistente BRYNIX**.
 
-### Identidade e Estilo
-- Estilo: executivo, claro, cordial, com leve humor.
-- Objetivo: ajudar pessoas com projetos, ofertas e automações da BRYNIX.
-- Você **não é uma enciclopédia geral**. Se a pergunta não tiver relação com BRYNIX, redirecione educadamente.
+Estilo: executivo, claro, cordial, com leve humor.
+Foco: sempre responder a partir da perspectiva da BRYNIX (empresa, projetos, ofertas, automações, clientes).
+Você **não é** uma enciclopédia geral**: se receber perguntas que não tenham relação com BRYNIX, redirecione de forma educada.
 
 ### Diretrizes
-- Priorize sempre o contexto BRYNIX: visão, ofertas, metodologia, exemplos práticos e próximos passos.
-- Responda em PT-BR. Prefira 2–4 parágrafos curtos ou bullets quando ajudar na clareza.
-- Evite respostas genéricas; conecte com valor prático (o que fazer agora).
-- Se o pedido for fora de escopo (ex.: Guerra do Golfo), diga algo como:
-  "Esse tema foge do meu escopo. Meu foco é apoiar você com os projetos e soluções da BRYNIX.
-   Posso conectar esse assunto à forma como tratamos análise de riscos, cenários ou gestão de stakeholders?"
-- Finalize, quando fizer sentido, com um convite à ação (ex.: “Quer que eu monte um próximo passo?”).
-
-### Conhecimento Interno (base)
-${BRYNIX_KB}
+- Responda em PT-BR, com 2–4 parágrafos curtos ou bullets quando ajudar na clareza.
+- Se a pergunta for fora de escopo (ex.: “Guerra do Golfo”), diga algo como:
+  “Esse tema não faz parte do meu escopo. Meu papel é ajudar você com os projetos e soluções da BRYNIX.”
+- Evite respostas genéricas demais. Traga utilidade prática ligada à BRYNIX.
+- Conclua com um convite a um próximo passo (quando fizer sentido).
 `;
 
-/**
- * Monta o prompt do usuário + contexto de remetente.
- * ctx: { from, pushName, projectName, role, extraContext }
- */
 function buildUserPrompt(userText, ctx = {}) {
-  const name = ctx.pushName ? `${ctx.pushName}` : (ctx.from ? `${ctx.from}` : 'usuário');
-
-  // Se você já tiver guardado o nome do projeto / marcos,
-  // pode incluir aqui para o modelo usar como contexto.
-  const project = ctx.projectName ? `Projeto: ${ctx.projectName}\n` : '';
-
-  const extra =
-    ctx.extraContext && String(ctx.extraContext).trim().length > 0
-      ? `Contexto extra: ${ctx.extraContext}\n`
-      : '';
-
-  return [
-    `Remetente: ${name}`,
-    project,
-    extra,
-    `Mensagem do usuário: """${userText}"""`,
-  ].join('\n');
+  const name = ctx?.pushName ? `(${ctx.pushName})` : '';
+  const origin = ctx?.from ? ` [origem: ${ctx.from}]` : '';
+  return `Mensagem${name}${origin}: ${userText}`;
 }
 
-/**
- * Extrai o texto da resposta da Responses API (v4).
- */
-function extractText(resp) {
-  try {
-    // Atalho do SDK v4:
-    if (resp && typeof resp.output_text === 'string') {
-      return resp.output_text.trim();
-    }
-    // fallback defensivo:
-    if (resp?.output?.[0]?.content?.[0]?.text) {
-      return String(resp.output[0].content[0].text).trim();
-    }
-  } catch (_) {}
-  return 'Tive um problema para formular a resposta agora. Pode tentar novamente?';
-}
-
-/**
- * Gera a resposta final do assistente.
- * userText: string com a mensagem do usuário
- * ctx: { from, pushName, projectName, role, extraContext }
- */
 async function generateReply(userText, ctx = {}) {
-  if (!API_KEY) {
-    return 'Configuração de IA ausente (OPENAI_API_KEY).';
+  try {
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: buildUserPrompt(userText, ctx) },
+    ];
+
+    const resp = await client.responses.create({
+      model: MODEL,
+      input: messages.map(m => ({ role: m.role, content: m.content })),
+      max_output_tokens: 400,
+      temperature: 0.5,
+    });
+
+    const out = resp?.output_text?.trim();
+    return out || 'Certo! Pode me contar um pouco mais do que você precisa?';
+  } catch (err) {
+    console.error('[AI] Erro generateReply:', err?.message || err);
+    return 'Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?';
   }
-
-  const userPrompt = buildUserPrompt(userText, ctx);
-
-  // Ajuste de temperatura e comprimento para ser assertivo sem ficar “seco”.
-  const temperature = 0.5;
-  const maxTokens = 450; // ~ 2–3 parágrafos/bullets bons
-
-  const messages = [
-    {
-      role: 'system',
-      content: [{ type: 'text', text: SYSTEM_PROMPT }],
-    },
-    {
-      role: 'user',
-      content: [{ type: 'text', text: userPrompt }],
-    },
-  ];
-
-  // Responses API
-  const resp = await client.responses.create({
-    model: MODEL,
-    input: messages,
-    max_output_tokens: maxTokens,
-    temperature,
-  });
-
-  return extractText(resp);
 }
 
-module.exports = { generateReply };
+// Summariza um conjunto de eventos (log leve) em status executivo.
+async function summarizeLog(events = [], projectName = 'Projeto', minutes = 1440) {
+  try {
+    const header = `Resumo das últimas ${minutes} min – ${projectName}`;
+    const bullets = events.slice(-200).map(e => {
+      const who = e.senderName || e.sender || 'alguém';
+      const kind = e.type || 'msg';
+      const txt = (e.text || e.caption || '').slice(0, 400).replace(/\s+/g, ' ').trim();
+      return `- [${e.ts}] (${who}; ${kind}) ${txt}`;
+    }).join('\n');
+
+    const prompt = `
+Você é GP da BRYNIX. Gere um status report objetivo. 
+Entrada (log enxuto):
+${bullets || '(sem eventos relevantes no período)'}
+Saída:
+- Principais avanços (bullets)
+- Pendências e riscos (bullets)
+- Próximos passos (bullets)
+- % de avanço geral (estimativa)
+- Tom curto, executivo, em PT-BR.
+`;
+
+    const resp = await client.responses.create({
+      model: MODEL,
+      input: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: prompt }
+      ],
+      max_output_tokens: 500,
+      temperature: 0.4,
+    });
+
+    const out = resp?.output_text?.trim();
+    return out || `${header}\n(não há dados suficientes para um resumo significativo)`;
+  } catch (err) {
+    console.error('[AI] Erro summarizeLog:', err?.message || err);
+    return 'Não consegui gerar o sumário agora. Tente novamente em instantes.';
+  }
+}
+
+module.exports = { generateReply, summarizeLog };
