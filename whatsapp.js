@@ -1,251 +1,173 @@
 // whatsapp.js
-const fs = require('fs');
-const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const { generateReply } = require('./ai');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { generateReply, summarizeLog } = require('./ai');
+const {
+  setGroupConfig, getGroupConfig,
+  appendLog, readRecentLog, notifyZap, saveMediaToDisk
+} = require('./gp');
 
-// =====================
-// Configurações
-// =====================
 const SESSION_PATH = process.env.WA_SESSION_PATH || '/var/data/wa-session';
-const REINIT_COOLDOWN_MS = 30_000;       // não tentar reiniciar mais de 1x a cada 30s
-const WATCHDOG_INTERVAL_MS = 60_000;     // verificação a cada 60s
-const DB_FILE = path.join(process.env.WA_SESSION_PATH || '/var/data', 'botdb.json');
+const REINIT_COOLDOWN_MS = 30_000;
+const WATCHDOG_INTERVAL_MS = 60_000;
 
 let currentState = 'starting';
-let lastQr = ''; // QR em memória (servido em /wa-qr)
+let lastQr = '';
 let reinitNotBefore = 0;
 let client;
 
-// =====================
-// “Banco” simples por grupo (persistido)
-// =====================
-function loadDB() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-    }
-  } catch {}
-  return { chats: {} }; // { chats: { [chatId]: { mode: 'concierge'|'project', memory: [] } } }
-}
-function saveDB(db) {
-  try {
-    fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-  } catch (e) {
-    console.error('[DB] Falha ao salvar DB:', e);
-  }
-}
-const db = loadDB();
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
-function getChatConfig(chatId) {
-  db.chats[chatId] ??= { mode: 'concierge', memory: [] };
-  return db.chats[chatId];
-}
-function setChatMode(chatId, mode) {
-  const cfg = getChatConfig(chatId);
-  cfg.mode = mode;
-  saveDB(db);
-}
+function getLastQr() { return lastQr; }
 
-// =====================
-// Webhook de alerta (Zapier) opcional
-// =====================
 async function sendAlert(payload) {
   const url = process.env.ALERT_WEBHOOK_URL;
-  if (!url) {
-    console.log('ℹ️ ALERT_WEBHOOK_URL não configurada; alerta:', payload);
-    return;
-  }
+  if (!url) { console.log('ℹ️ ALERT_WEBHOOK_URL não configurada; alerta:', payload); return; }
   try {
-    const body =
-      typeof payload === 'string'
-        ? { text: payload }
-        : payload || { text: '⚠️ Alerta sem conteúdo' };
-
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const body = typeof payload === 'string' ? { text: payload } : (payload || { text: '⚠️ Alerta sem conteúdo' });
+    await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     console.log('🚨 Alerta enviado com sucesso.');
   } catch (err) {
     console.error('❌ Erro ao enviar alerta para webhook:', err);
   }
 }
 
-// =====================
-// Client builder e ciclo de vida
-// =====================
 function buildClient() {
   return new Client({
-    authStrategy: new LocalAuth({
-      clientId: 'brynix-bot',
-      dataPath: SESSION_PATH,
-    }),
+    authStrategy: new LocalAuth({ clientId: 'brynix-bot', dataPath: SESSION_PATH }),
     puppeteer: {
-      headless: true,
-      timeout: 60_000,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
-      ],
+      headless: true, timeout: 60_000,
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process'],
     },
-    restartOnAuthFail: true,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 5_000,
+    restartOnAuthFail: true, takeoverOnConflict: true, takeoverTimeoutMs: 5_000,
   });
 }
 
-async function safeReinit(reason = 'unknown') {
+async function safeReinit(reason='unknown') {
   const now = Date.now();
-  if (now < reinitNotBefore) {
-    console.log(`[WA] Reinit ignorado (cooldown). Motivo: ${reason}`);
-    return;
-  }
+  if (now < reinitNotBefore) { console.log(`[WA] Reinit ignorado (cooldown). Motivo: ${reason}`); return; }
   reinitNotBefore = now + REINIT_COOLDOWN_MS;
-
-  try {
-    console.log(`[WA] Reinicializando cliente. Motivo: ${reason}`);
-    if (client) {
-      try { await client.destroy(); } catch {}
-    }
-  } catch (err) {
-    console.error('[WA] Erro ao destruir cliente:', err);
-  }
-
+  try { if (client) { try { await client.destroy(); } catch (_) {} } } catch (e) { console.error('[WA] destroy err:', e); }
   client = buildClient();
   wireEvents(client);
   client.initialize();
 }
 
-function shouldRespondInGroup(text, msg, myId) {
-  const t = (text || '').toLowerCase().trim();
-  // 1) menção direta ao bot?
-  if (msg.mentionedIds && msg.mentionedIds.includes(myId)) return true;
-  // 2) prefixo bot:
-  if (t.startsWith('bot:') || t.startsWith('@bot')) return true;
-  // 3) palavras-chave leves
-  const keys = ['@brynix', 'brynix', 'assistente', 'bot'];
-  return keys.some(k => t.includes(k));
-}
-
 function wireEvents(c) {
-  c.on('qr', (qr) => {
-    lastQr = qr;
-    currentState = 'qr';
-    console.log('[WA] QR gerado. Abra /wa-qr para escanear.');
-    sendAlert('🔄 BOT Brynix requer novo pareamento: abra /wa-qr e escaneie o código.');
-  });
+  c.on('qr', (qr) => { lastQr = qr; currentState='qr'; console.log('[WA] QR gerado. Abra /wa-qr para escanear.'); sendAlert('🔄 BOT Brynix requer novo pareamento: abra /wa-qr e escaneie o código.'); });
+  c.on('authenticated', () => console.log('[WA] Autenticado'));
+  c.on('auth_failure', (m) => { console.error('[WA] Falha de autenticação:', m); sendAlert(`⚠️ Falha de autenticação: ${m||'motivo não informado'}`); safeReinit('auth_failure'); });
+  c.on('ready', () => { currentState='ready'; console.log('[WA] Cliente pronto ✅'); sendAlert('✅ BOT Brynix online e pronto.'); });
+  c.on('change_state', (s) => { currentState = s || currentState; console.log('[WA] Estado alterado:', currentState); });
+  c.on('loading_screen', (p, msg) => console.log(`[WA] loading_screen: ${p}% - ${msg}`));
+  c.on('disconnected', (reason) => { currentState='disconnected'; console.error('[WA] Desconectado:', reason); sendAlert(`❌ BOT Brynix desconectado: ${reason||'n/i'}`); safeReinit(`disconnected:${reason||'unknown'}`); });
 
-  c.on('authenticated', () => {
-    console.log('[WA] Autenticado');
-  });
-
-  c.on('auth_failure', (m) => {
-    console.error('[WA] Falha de autenticação:', m);
-    sendAlert(`⚠️ Falha de autenticação do BOT Brynix: ${m || 'motivo não informado'}`);
-    safeReinit('auth_failure');
-  });
-
-  c.on('ready', () => {
-    currentState = 'ready';
-    console.log('[WA] Cliente pronto ✅');
-    sendAlert('✅ BOT Brynix online e pronto.');
-  });
-
-  c.on('change_state', (state) => {
-    currentState = state || currentState;
-    console.log('[WA] Estado alterado:', currentState);
-  });
-
-  c.on('loading_screen', (percent, message) => {
-    console.log(`[WA] loading_screen: ${percent}% - ${message}`);
-  });
-
-  c.on('disconnected', (reason) => {
-    currentState = 'disconnected';
-    console.error('[WA] Desconectado:', reason);
-    sendAlert(`❌ BOT Brynix desconectado. Motivo: ${reason || 'não informado'}`);
-    safeReinit(`disconnected:${reason || 'unknown'}`);
-  });
-
-  // ============ Mensagens ============
+  // ========= Mensagens =========
   c.on('message', async (msg) => {
     try {
       const chat = await msg.getChat();
-      const contact = await msg.getContact();
-      const text = msg.body || '';
       const isGroup = chat.isGroup;
+      const sender = await msg.getContact();
+      const senderName = sender?.pushname || sender?.name || msg._data?.notifyName || msg.from;
 
-      // Só fala em grupo quando chamado
+      const baseLog = {
+        groupId: isGroup ? chat.id._serialized : null,
+        chatName: isGroup ? chat.name : null,
+        sender: msg.from,
+        senderName,
+      };
+
+      // Log leve de tudo (só em grupo) – ajuda no /summary
       if (isGroup) {
-        const me = await c.getNumberId(contact.number).catch(() => null);
-        // melhor forma de pegar o ID do bot:
-        const meId = c.info?.wid?._serialized;
-
-        if (!shouldRespondInGroup(text, msg, meId)) {
-          return; // silencioso
+        if (msg.hasMedia) {
+          appendLog(chat.id._serialized, { ...baseLog, type: 'media', caption: msg.caption || '' });
+        } else {
+          appendLog(chat.id._serialized, { ...baseLog, type: 'text', text: msg.body });
         }
       }
 
-      // Comandos de modo (só em grupo)
+      // ====== Grupo (modo GP c/ comandos) ======
       if (isGroup) {
-        const lower = text.toLowerCase().trim();
-        if (lower.includes('/mode project')) {
-          setChatMode(chat.id._serialized, 'project');
-          await msg.reply('Modo **PROJETO** ativado para este grupo ✅');
-          return;
+        // Comandos começam com '/'. Se não for comando, não responde em grupo.
+        if (!String(msg.body || msg.caption || '').trim().startsWith('/')) return;
+
+        const raw = (msg.body || msg.caption || '').trim();
+        const [cmd, ...rest] = raw.split(' ');
+        const argLine = raw.slice(cmd.length).trim();
+
+        switch ((cmd || '').toLowerCase()) {
+          case '/setup': {
+            // formato: /setup <URL_sheet> | <Nome do Projeto>
+            const [sheetUrlRaw, projRaw] = argLine.split('|').map(s => (s||'').trim());
+            if (!sheetUrlRaw || !projRaw) {
+              await msg.reply('Uso: /setup <URL_da_planilha> | <Nome do Projeto>');
+              return;
+            }
+            setGroupConfig(chat.id._serialized, { sheetUrl: sheetUrlRaw, projectName: projRaw });
+            await msg.reply(`Config salva!\nProjeto: *${projRaw}*\nSheet: ${sheetUrlRaw}`);
+            await notifyZap('setup', { groupId: chat.id._serialized, projectName: projRaw, sheetUrl: sheetUrlRaw });
+            break;
+          }
+
+          case '/who': {
+            const cfg = getGroupConfig(chat.id._serialized);
+            if (!cfg) { await msg.reply('Nenhuma configuração encontrada. Use: /setup <URL> | <Projeto>'); return; }
+            await msg.reply(`Projeto: *${cfg.projectName || 'n/i'}*\nSheet: ${cfg.sheetUrl || 'n/i'}`);
+            break;
+          }
+
+          case '/note': {
+            const txt = argLine || '(sem texto)';
+            appendLog(chat.id._serialized, { ...baseLog, type: 'note', text: txt });
+            await msg.reply('Anotado ✅');
+            await notifyZap('note', { groupId: chat.id._serialized, projectName: getGroupConfig(chat.id._serialized)?.projectName, text: txt, sender: senderName });
+            break;
+          }
+
+          case '/doc': {
+            if (!msg.hasMedia) { await msg.reply('Envie um **arquivo** com a legenda `/doc <título>`'); return; }
+            const media = await msg.downloadMedia(); // { data (base64), mimetype, filename? }
+            const title = argLine || 'documento';
+            const stamp = Date.now();
+            const file = saveMediaToDisk(chat.id._serialized, media, `${stamp}-${slugify(title)}`);
+            appendLog(chat.id._serialized, { ...baseLog, type: 'doc', text: title, path: file });
+            await msg.reply(`Documento recebido e salvo ✅\n${pathShort(file)}`);
+            await notifyZap('doc', { groupId: chat.id._serialized, projectName: getGroupConfig(chat.id._serialized)?.projectName, title, path: file, mimetype: media.mimetype, sender: senderName });
+            break;
+          }
+
+          case '/summary': {
+            const cfg = getGroupConfig(chat.id._serialized) || {};
+            const events = readRecentLog(chat.id._serialized, 1440); // 24h
+            const text = await summarizeLog(events, cfg.projectName || chat.name || 'Projeto', 1440);
+            await msg.reply(text);
+            await notifyZap('summary', { groupId: chat.id._serialized, projectName: cfg.projectName, size: events.length });
+            break;
+          }
+
+          default:
+            await msg.reply('Comandos disponíveis: /setup | /who | /note | /doc | /summary');
         }
-        if (lower.includes('/mode concierge')) {
-          setChatMode(chat.id._serialized, 'concierge');
-          await msg.reply('Modo **CONCIERGE** (padrão) ativado para este grupo ✅');
-          return;
-        }
+        return; // grupo – não cai no fluxo de IA padrão abaixo
       }
 
-      // Persona por chat
-      const chatId = chat.id._serialized;
-      const { mode } = getChatConfig(chatId);
-      console.log(`[WA] (${isGroup ? 'GROUP' : '1:1'}) ${chatId} | mode=${mode} | from=${msg.from} | "${text}"`);
-
-      // Chama a IA com persona dinâmica
-      const reply = await generateReply(text, {
-        from: msg.from,
-        pushName: msg._data?.notifyName,
-        isGroup,
-        mode, // 'concierge' | 'project'
-        chatTitle: isGroup ? chat.name : undefined,
-      });
-
+      // ====== 1:1 (fluxo IA atual) ======
+      const reply = await generateReply(msg.body, { from: msg.from, pushName: senderName });
       await msg.reply(reply);
-      console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${reply}"`);
+      console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${(reply||'').slice(0,120)}..."`);
     } catch (err) {
-      console.error('[WA] Erro ao processar/enviar resposta (IA):', err);
-      try {
-        await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?');
-      } catch {}
-      sendAlert(`❗ Erro ao responder mensagem: ${err?.message || err}`);
+      console.error('[WA] Erro ao processar mensagem:', err);
+      try { await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?'); } catch (_) {}
     }
   });
 }
 
-// =====================
-// API pública para server.js
-// =====================
-function getLastQr() {
-  return lastQr;
-}
+function pathShort(p) { return p.replace(/^\/var\/data\//, '/data/'); }
+function slugify(s='') { return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,''); }
 
 function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
 
-  // Health
   if (app && app.get) {
     app.get('/wa-status', async (_req, res) => {
       let state = currentState;
@@ -259,7 +181,6 @@ function initWhatsApp(app) {
 
   client.initialize();
 
-  // Watchdog
   setInterval(async () => {
     try {
       const s = await client.getState().catch(() => null);
