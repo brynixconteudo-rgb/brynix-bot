@@ -1,5 +1,6 @@
 // whatsapp.js
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const { generateReply } = require('./ai');
 
 let currentState = 'starting';
 let lastQr = ''; // mantém o último QR gerado em memória
@@ -96,26 +97,24 @@ function initWhatsApp(app) {
   });
 
   // ---------- Mensagens ----------
-  client.on('message', async (msg) => {
-    try {
-      console.log(`[WA] Mensagem recebida de ${msg.from}: "${msg.body}"`);
-      const texto = (msg.body || '').trim().toLowerCase();
+client.on('message', async (msg) => {
+  try {
+    console.log(`[WA] Mensagem recebida de ${msg.from}: "${msg.body}"`);
 
-      let reply;
-      if (texto === 'oi') {
-        reply = 'Olá! 👋 Aqui é o Bot da BRYNIX, pronto para ajudar.';
-      } else {
-        reply = 'Recebi sua mensagem, já já respondo com novidades 🚀';
-      }
+    // Chama a IA
+    const reply = await generateReply(msg.body, {
+      from: msg.from,
+      pushName: msg._data?.notifyName
+    });
 
-      await msg.reply(reply);
-      console.log(`[WA] Resposta enviada para ${msg.from}: "${reply}"`);
-    } catch (err) {
-      console.error('[WA] Erro ao processar/enviar resposta:', err);
-      // opcional: reportar erro de runtime no webhook
-      sendAlert(`❗ Erro ao responder mensagem: ${err?.message || err}`);
-    }
-  });
+    // Responde no WhatsApp
+    await msg.reply(reply);
+    console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${reply}"`);
+  } catch (err) {
+    console.error('[WA] Erro ao processar/enviar resposta (IA):', err);
+    await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?');
+  }
+});
 
   // ---------- Health endpoint ----------
   if (app && app.get) {
