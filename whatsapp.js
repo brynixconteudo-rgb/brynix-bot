@@ -1,18 +1,30 @@
 // whatsapp.js
+// Bot WhatsApp Brynix: IA + Anexos → Google Drive + LOG no Sheets + watchdog.
+// Requer: GOOGLE_SA_JSON, GOOGLE_DRIVE_ROOT_FOLDER_ID, (opcional) LINKS_DB_PATH, ALERT_WEBHOOK_URL.
+
+const fs = require('node:fs');
+const path = require('node:path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { generateReply } = require('./ai');
-const { getLink, setLink, removeLink } = require('./group-links');
+const { uploadBuffer } = require('./drive');
+const { appendLog } = require('./sheets');
 
+// =====================
+// Configurações
+// =====================
 const SESSION_PATH = process.env.WA_SESSION_PATH || '/var/data/wa-session';
-const REINIT_COOLDOWN_MS = 30_000;
+const REINIT_COOLDOWN_MS = 30_000; // evitar loop de reinit
 const WATCHDOG_INTERVAL_MS = 60_000;
 
 let currentState = 'starting';
 let lastQr = '';
 let reinitNotBefore = 0;
 let client;
+let selfId = null; // id do próprio bot (para detectar menções)
 
-// ---------------- Utils ----------------
+// =====================
+// Utils
+// =====================
 function getLastQr() {
   return lastQr;
 }
@@ -40,6 +52,57 @@ async function sendAlert(payload) {
   }
 }
 
+/** Lê o mapeamento de grupo → sheetId de um JSON simples no disco (opcional). */
+function loadLinksDb() {
+  const p = process.env.LINKS_DB_PATH;
+  if (!p) return null;
+  try {
+    const raw = fs.readFileSync(p, 'utf8');
+    const json = JSON.parse(raw || '{}');
+    return json && typeof json === 'object' ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Tenta resolver o sheetId para um chatId usando o arquivo de links e/ou env fallback. */
+function resolveSheetIdForChat(chatId) {
+  // 1) arquivo JSON { "<groupId>": "<sheetId>", ... }
+  const db = loadLinksDb();
+  if (db && db[chatId]) return db[chatId];
+
+  // 2) fallback “geral” (se você quiser um default temporário)
+  if (process.env.PROJECT_SHEET_ID) return process.env.PROJECT_SHEET_ID;
+
+  return null;
+}
+
+/** Reinicializa o cliente com cooldown. */
+async function safeReinit(reason = 'unknown') {
+  const now = Date.now();
+  if (now < reinitNotBefore) {
+    console.log(`[WA] Reinit ignorado (cooldown). Motivo: ${reason}`);
+    return;
+  }
+  reinitNotBefore = now + REINIT_COOLDOWN_MS;
+
+  try {
+    console.log(`[WA] Reinicializando cliente. Motivo: ${reason}`);
+    if (client) {
+      try { await client.destroy(); } catch (_) {}
+    }
+  } catch (err) {
+    console.error('[WA] Erro ao destruir cliente:', err);
+  }
+
+  client = buildClient();
+  wireEvents(client);
+  client.initialize();
+}
+
+// =====================
+// Client
+// =====================
 function buildClient() {
   return new Client({
     authStrategy: new LocalAuth({
@@ -64,77 +127,6 @@ function buildClient() {
   });
 }
 
-async function safeReinit(reason = 'unknown') {
-  const now = Date.now();
-  if (now < reinitNotBefore) {
-    console.log(`[WA] Reinit ignorado (cooldown). Motivo: ${reason}`);
-    return;
-  }
-  reinitNotBefore = now + REINIT_COOLDOWN_MS;
-
-  try {
-    console.log(`[WA] Reinicializando cliente. Motivo: ${reason}`);
-    if (client) {
-      try { await client.destroy(); } catch (_) {}
-    }
-  } catch (err) {
-    console.error('[WA] Erro ao destruir cliente:', err);
-  }
-
-  client = buildClient();
-  wireEvents(client);
-  client.initialize();
-}
-
-// ---------------- Comandos de grupo ----------------
-function parseCommand(text) {
-  if (!text) return null;
-  const t = text.trim();
-
-  if (!t.startsWith('/')) return null;
-
-  // formatos aceitos:
-  // /setup <spreadsheetId>
-  // /setup <spreadsheetId> | <Nome do Projeto>
-  // /unlink
-  // /link?
-  const cmd = t.split(' ')[0].toLowerCase();
-
-  if (cmd === '/setup') {
-    const rest = t.slice('/setup'.length).trim();
-    if (!rest) return { cmd: 'setup', error: 'Faltou o spreadsheetId.' };
-
-    let spreadsheetId = rest;
-    let projectName = '';
-
-    // suporta separador " | "
-    if (rest.includes('|')) {
-      const [idPart, namePart] = rest.split('|');
-      spreadsheetId = (idPart || '').trim();
-      projectName = (namePart || '').trim();
-    }
-
-    if (!spreadsheetId) return { cmd: 'setup', error: 'SpreadsheetId inválido.' };
-    return { cmd: 'setup', spreadsheetId, projectName };
-  }
-
-  if (cmd === '/unlink') return { cmd: 'unlink' };
-  if (cmd === '/link?' || cmd === '/link') return { cmd: 'link?' };
-
-  return { cmd: 'unknown' };
-}
-
-function userMentionedMe(msg) {
-  // Em grupos, mensagem tem `mentionedIds`
-  try {
-    const mentions = msg.mentionedIds || [];
-    return mentions.includes(client.info.wid._serialized);
-  } catch {
-    return false;
-  }
-}
-
-// ---------------- Eventos ----------------
 function wireEvents(c) {
   c.on('qr', (qr) => {
     lastQr = qr;
@@ -155,7 +147,8 @@ function wireEvents(c) {
 
   c.on('ready', () => {
     currentState = 'ready';
-    console.log('[WA] Cliente pronto ✅');
+    selfId = c.info?.wid?._serialized || null;
+    console.log('[WA] Cliente pronto ✅', selfId ? `(selfId: ${selfId})` : '');
     sendAlert('✅ BOT Brynix online e pronto.');
   });
 
@@ -175,92 +168,112 @@ function wireEvents(c) {
     safeReinit(`disconnected:${reason || 'unknown'}`);
   });
 
-  // ------------- Mensagens -------------
+  // --------------------
+  // Mensagens
+  // --------------------
   c.on('message', async (msg) => {
     try {
-      const text = (msg.body || '').trim();
-      const from = msg.from || '';
-      const isGroup = from.endsWith('@g.us');
+      const chat = await msg.getChat();
+      const isGroup = chat?.isGroup;
+      const authorName = msg._data?.notifyName || '';
 
-      // 1) Se for grupo: só respondo se for comando OU se fui mencionado
-      let isCommand = false;
-      let parsed = null;
+      // 1) ANEXOS → Drive + LOG
+      if (msg.hasMedia) {
+        try {
+          const media = await msg.downloadMedia(); // { data(base64), mimetype, filename }
+          if (media && media.data) {
+            const buffer = Buffer.from(media.data, 'base64');
+            const ext = (media.mimetype && media.mimetype.split('/')[1]) || 'bin';
+            const filename = (media.filename && media.filename.trim()) || `arquivo-${Date.now()}.${ext}`;
 
-      if (isGroup) {
-        parsed = parseCommand(text);
-        isCommand = !!parsed;
+            const projectName = (isGroup && chat?.name) ? chat.name : 'Projeto';
+            const upload = await uploadBuffer({
+              projectName,
+              filename,
+              mimetype: media.mimetype,
+              buffer
+            });
 
-        if (!isCommand && !userMentionedMe(msg)) {
-          // ignora conversa entre humanos
-          return;
-        }
-      }
+            // tenta registrar LOG no Sheets (se mapeado)
+            const sheetId = isGroup ? resolveSheetIdForChat(chat.id._serialized) : resolveSheetIdForChat(msg.from);
+            if (sheetId) {
+              try {
+                await appendLog(sheetId, {
+                  tipo: 'Upload',
+                  autor: authorName,
+                  mensagem: `Upload recebido no grupo "${projectName}"`,
+                  arquivo: filename,
+                  link: upload.webViewLink || upload.webContentLink || '',
+                  obs: ''
+                });
+              } catch (e) {
+                console.error('[LOG] Falha ao registrar no Sheets:', e?.message || e);
+              }
+            }
 
-      // 2) Trata comandos de grupo
-      if (isGroup && isCommand) {
-        if (parsed.cmd === 'setup') {
-          if (parsed.error) {
-            await msg.reply(`❗ ${parsed.error}\nExemplo:\n/setup 1xX...abc | Pirâmide Imóveis`);
+            const link = upload.webViewLink || upload.webContentLink || '';
+            const confirm =
+              `📎 *Arquivo recebido*\n` +
+              `• Nome: ${filename}\n` +
+              (isGroup ? `• Projeto: ${projectName}\n` : '') +
+              (link ? `• Acesso: ${link}\n` : '• Acesso: (restrito ao Drive)\n') +
+              `\n✅ Salvo na pasta do mês do projeto.`;
+            await msg.reply(confirm);
+            console.log(`[WA] Upload ok (${filename}) ${link ? '→ link enviado' : ''}`);
+            // Não continua para IA se era só anexo:
             return;
           }
-          const link = await setLink(from, parsed.spreadsheetId, parsed.projectName);
-          await msg.reply(
-            `✅ Projeto vinculado!\n• Planilha: ${link.spreadsheetId}\n• Nome: ${link.projectName || '(não informado)'}`
-          );
-          return;
-        }
-
-        if (parsed.cmd === 'unlink') {
-          await removeLink(from);
-          await msg.reply('🗑️ Vínculo com planilha removido para este grupo.');
-          return;
-        }
-
-        if (parsed.cmd === 'link?') {
-          const link = await getLink(from);
-          if (!link) {
-            await msg.reply('ℹ️ Este grupo ainda não está vinculado a nenhuma planilha. Use:\n/setup <spreadsheetId> | <Nome opcional>');
-          } else {
-            await msg.reply(`🔗 Vínculo atual:\n• Planilha: ${link.spreadsheetId}\n• Nome: ${link.projectName || '(não informado)'}\n• Atualizado: ${link.updatedAt}`);
-          }
-          return;
-        }
-
-        if (parsed.cmd === 'unknown') {
-          await msg.reply('🤖 Comando não reconhecido. Use /setup, /link? ou /unlink.');
+        } catch (e) {
+          console.error('[WA] Erro ao processar anexo:', e);
+          await msg.reply('❌ Tive um problema ao salvar seu arquivo no Drive. Pode reenviar em instantes?');
           return;
         }
       }
 
-      // 3) Fluxo de IA (1:1 sempre; em grupo só se mencionado/foi comando acima)
-      console.log(`[WA] Mensagem recebida de ${from}: "${text}"`);
+      // 2) TEXTO → IA (regras de grupo x 1:1)
+      const body = (msg.body || '').trim();
+      const isCommand = body.startsWith('/');
+      let mentioned = false;
 
-      // (no futuro) você pode recuperar o link do grupo e passar como contexto pra IA
-      // const link = isGroup ? (await getLink(from)) : null;
+      if (isGroup && selfId) {
+        try {
+          const mentions = await msg.getMentions();
+          mentioned = Array.isArray(mentions) && mentions.some(m => m.id?._serialized === selfId);
+        } catch (_) {}
+      }
 
-      const reply = await generateReply(text, {
-        from,
-        pushName: msg._data?.notifyName,
+      // Em grupo: só responde se for mencionado ou comando:
+      if (isGroup && !isCommand && !mentioned) {
+        // silencia para não poluir conversa
+        return;
+      }
+
+      // Chama IA
+      const reply = await generateReply(body, {
+        from: msg.from,
+        pushName: authorName,
         isGroup,
+        groupName: isGroup ? chat?.name : undefined
       });
 
       await msg.reply(reply);
-      console.log(`[WA] Resposta (IA) enviada para ${from}: "${reply}"`);
+      console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${(reply || '').slice(0, 120)}..."`);
     } catch (err) {
-      console.error('[WA] Erro ao processar/enviar resposta (IA):', err);
-      try {
-        await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?');
-      } catch (_) {}
+      console.error('[WA] Erro ao processar mensagem:', err);
+      try { await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?'); } catch (_) {}
       sendAlert(`❗ Erro ao responder mensagem: ${err?.message || err}`);
     }
   });
 }
 
-// ---------------- Inicialização ----------------
+// =====================
+// Inicialização pública
+// =====================
 function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
 
+  // Health
   if (app && app.get) {
     app.get('/wa-status', async (_req, res) => {
       let state = currentState;
@@ -274,6 +287,7 @@ function initWhatsApp(app) {
 
   client.initialize();
 
+  // Watchdog
   setInterval(async () => {
     try {
       const s = await client.getState().catch(() => null);
