@@ -1,17 +1,22 @@
 {
   "name": "brynix-bot",
   "version": "1.0.0",
-  "main": "server.js",
+  "private": true,
   "type": "commonjs",
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" },
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test:sheets": "node sheets-test.js"
+  },
   "dependencies": {
-    "express": "^4.19.2",
     "body-parser": "^1.20.2",
-    "whatsapp-web.js": "^1.25.0",
-    "qrcode": "^1.5.3",
+    "express": "^4.19.2",
+    "googleapis": "^131.0.0",
     "openai": "^4.55.0",
-    "node-fetch": "^3.3.2"
-    "googleapis": "^131.0.0"
+    "qrcode": "^1.5.3",
+    "whatsapp-web.js": "^1.25.0"
   }
 }
