@@ -1,28 +1,42 @@
 // sheets.js
-// Acesso ao Google Sheets usando Service Account JSON da env GOOGLE_SA_JSON.
-// Helpers: resolver ID, ler metadados e tarefas, gerar resumo, e registrar LOG.
+// Integração com Google Sheets (Service Account) para ler/escrever
+// - Lê metadados do projeto (aba: Dados_Projeto)
+// - Lê tarefas (aba: Tarefas)
+// - Escreve LOG (aba: Atualizacao_LOG)
 
 const { google } = require('googleapis');
+
+// ===== Helpers =====
+function stripAccents(s = '') {
+  return s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
 
 function parseServiceAccount() {
   const raw = process.env.GOOGLE_SA_JSON || '';
   if (!raw) throw new Error('GOOGLE_SA_JSON ausente.');
   try {
     return JSON.parse(raw);
-  } catch (e) {
-    // caso alguém cole o JSON “bonito” com quebras, ainda funciona
+  } catch {
+    // caso cole o JSON com quebras
     return JSON.parse(raw.replace(/\n/g, '\\n'));
   }
 }
 
-function buildSheetsClient(scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']) {
+function buildSheetsClient(write = false) {
   const sa = parseServiceAccount();
-  const jwt = new google.auth.JWT(
-    sa.client_email,
-    null,
-    sa.private_key,
-    scopes,
-  );
+  const scopes = write
+    ? [
+        'https://www.googleapis.com/auth/spreadsheets', // leitura + escrita
+      ]
+    : [
+        'https://www.googleapis.com/auth/spreadsheets.readonly', // só leitura
+      ];
+
+  const jwt = new google.auth.JWT(sa.client_email, null, sa.private_key, scopes);
   return google.sheets({ version: 'v4', auth: jwt });
 }
 
@@ -30,18 +44,18 @@ function extractSheetId(urlOrId) {
   if (!urlOrId) return null;
   const m = String(urlOrId).match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
   if (m && m[1]) return m[1];
-  // se já vier o ID puro
   if (/^[a-zA-Z0-9-_]{20,}$/.test(urlOrId)) return urlOrId;
   return null;
 }
 
+// ===== Leitura dos metadados =====
 async function readProjectMeta(sheetId) {
-  const sheets = buildSheetsClient();
-  // A1:B10 para Dados_Projeto
+  const sheets = buildSheetsClient(false);
   const meta = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
     range: 'Dados_Projeto!A1:B10',
   });
+
   const rows = meta.data.values || [];
   const obj = {};
   rows.forEach(([k, v]) => {
@@ -50,88 +64,125 @@ async function readProjectMeta(sheetId) {
   return obj; // { ProjectName, GroupId, Timezone, DailyReminderTime, ... }
 }
 
+// ===== Leitura de tarefas =====
 async function readTasks(sheetId) {
-  const sheets = buildSheetsClient();
-  // Cabeçalho esperado nas colunas: Tarefa | Prioridade | Responsável | Status | Data de início | Data de término | Marco | Produtos | Observações
+  const sheets = buildSheetsClient(false);
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: 'Tarefas!A1:K1000',
+    range: 'Tarefas!A1:K2000',
   });
+
   const rows = resp.data.values || [];
   if (rows.length < 2) return [];
 
-  const header = rows[0].map(h => (h || '').toString().trim().toLowerCase());
+  const headerNorm = rows[0].map(h => stripAccents(h || ''));
+
+  const find = (label) => headerNorm.indexOf(label);
+  // Suportamos acentos/variações
   const idx = {
-    tarefa: header.indexOf('tarefa'),
-    prioridade: header.indexOf('prioridade'),
-    responsavel: header.indexOf('responsável'),
-    status: header.indexOf('status'),
-    dtini: header.indexOf('data de início'),
-    dtfim: header.indexOf('data de término'),
-    marco: header.indexOf('marco'),
-    obs: header.indexOf('observações'),
+    tarefa:         find('tarefa'),
+    prioridade:     find('prioridade'),
+    responsavel:    find('responsavel'),
+    status:         find('status'),
+    dtini:          find('data de inicio'),
+    dtfim:          find('data de termino'),
+    marco:          find('marco'),
+    produtos:       find('produtos'),
+    observacoes:    find('observacoes'),
   };
 
   const tasks = rows.slice(1).map(r => ({
-    tarefa: r[idx.tarefa] || '',
-    prioridade: r[idx.prioridade] || '',
-    responsavel: r[idx.responsavel] || '',
-    status: r[idx.status] || '',
-    dataInicio: r[idx.dtini] || '',
-    dataTermino: r[idx.dtfim] || '',
-    marco: r[idx.marco] || '',
-    observacoes: r[idx.obs] || '',
+    tarefa:       (r[idx.tarefa] || '').toString().trim(),
+    prioridade:   (r[idx.prioridade] || '').toString().trim(),
+    responsavel:  (r[idx.responsavel] || '').toString().trim(),
+    status:       (r[idx.status] || '').toString().trim(),
+    dataInicio:   (r[idx.dtini] || '').toString().trim(),
+    dataTermino:  (r[idx.dtfim] || '').toString().trim(),
+    marco:        (r[idx.marco] || '').toString().trim(),
+    produtos:     (r[idx.produtos] || '').toString().trim(),
+    observacoes:  (r[idx.observacoes] || '').toString().trim(),
   })).filter(t => t.tarefa);
 
   return tasks;
 }
 
+// ===== Sumário de status =====
 function buildStatusSummary(projectName, tasks) {
   const total = tasks.length;
+
   const byStatus = tasks.reduce((acc, t) => {
     const s = (t.status || 'Sem status').trim();
     acc[s] = (acc[s] || 0) + 1;
     return acc;
   }, {});
-  const topStatuses = Object.entries(byStatus)
+  const linhasStatus = Object.entries(byStatus)
     .sort((a, b) => b[1] - a[1])
     .map(([s, n]) => `• ${s}: ${n}`)
-    .join('\n');
+    .join('\n') || '—';
 
-  // abertas = não concluídas
-  const abertas = tasks.filter(t => !/conclu(i|í)da/i.test(t.status || '')).slice(0, 10);
-  const preview = abertas.map(t => `- ${t.tarefa} (${t.responsavel || 's/resp'})`).join('\n') || 'Nenhuma aberta.';
+  // atrasadas: dataTermino < hoje e não concluída
+  const hoje = new Date();
+  const atrasadas = tasks.filter(t => {
+    if (/conclu/i.test(t.status || '')) return false;
+    const dt = t.dataTermino?.trim();
+    if (!dt) return false;
+    // aceita dd/mm/yyyy
+    const m = dt.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+    if (!m) return false;
+    const d = new Date(+m[3], +m[2]-1, +m[1], 23, 59, 59);
+    return d < hoje;
+  });
 
-  return `*${projectName || 'Projeto'} — Status:*\n` +
-         `Total de tarefas: ${total}\n` +
-         `${topStatuses}\n\n` +
-         `*Abertas (amostra):*\n${preview}`;
+  const topAtrasadas = atrasadas.slice(0, 5)
+    .map(t => `- ${t.tarefa} (${t.responsavel || 's/resp'}) [${t.dataTermino || '?'}]`)
+    .join('\n') || 'Nenhuma atrasada.';
+
+  const abertas = tasks.filter(t => !/conclu/i.test(t.status || '')).slice(0, 8);
+  const previewAbertas = abertas
+    .map(t => `- ${t.tarefa} (${t.responsavel || 's/resp'})`)
+    .join('\n') || 'Nenhuma aberta.';
+
+  return (
+`*${projectName || 'Projeto'} — Status:*
+Total de tarefas: *${total}*
+
+*Por status:*
+${linhasStatus}
+
+*Em atraso (top 5):*
+${topAtrasadas}
+
+*Abertas (amostra):*
+${previewAbertas}`
+  );
 }
 
-/**
- * appendLog: registra uma linha na aba Atualizacao_LOG.
- * Espera que a aba tenha cabeçalho semelhante a:
- * Timestamp | Tipo | Autor | Mensagem | Arquivo | Link_GDrive | Observações
- */
-async function appendLog(sheetId, entry) {
-  const sheets = buildSheetsClient(['https://www.googleapis.com/auth/spreadsheets']);
-  const nowISO = new Date().toISOString();
+// ===== Filtro por responsável =====
+async function listTasksByAssignee(sheetId, nome) {
+  const tasks = await readTasks(sheetId);
+  const alvo = stripAccents(nome || '');
+  const filtradas = tasks.filter(t =>
+    stripAccents(t.responsavel || '').includes(alvo)
+  );
+  return filtradas;
+}
 
+// ===== LOG: Atualizacao_LOG =====
+async function writeLog(sheetId, { timestamp, usuario, acao, resultado, link }) {
+  const sheets = buildSheetsClient(true);
   const row = [
-    entry.timestamp || nowISO,
-    entry.tipo || 'Evento',
-    entry.autor || '',
-    entry.mensagem || '',
-    entry.arquivo || '',
-    entry.link || '',
-    entry.obs || ''
+    timestamp || new Date().toISOString(),
+    usuario || '',
+    acao || '',
+    resultado || '',
+    link || '',
   ];
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
-    range: 'Atualizacao_LOG!A:Z',
+    range: 'Atualizacao_LOG!A:E',
     valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [row] }
+    requestBody: { values: [row] },
   });
 }
 
@@ -140,5 +191,6 @@ module.exports = {
   readProjectMeta,
   readTasks,
   buildStatusSummary,
-  appendLog,
+  listTasksByAssignee,
+  writeLog,
 };
