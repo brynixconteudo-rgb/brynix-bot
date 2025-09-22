@@ -186,12 +186,41 @@ function wireEvents(c) {
   c.on('auth_failure', (m)=>{ console.error('[WA] auth_failure', m); safeReinit('auth_failure'); });
   c.on('ready', ()=>{ currentState='ready'; console.log('[WA] Pronto ✅'); });
   c.on('disconnected', (r)=>{ currentState='disconnected'; console.error('[WA] Desconectado', r); safeReinit('disconnected'); });
-
   c.on('message', async (msg) => {
-    try {
-      const chatId = msg.from;
-      const isGroup = isGroupMsg(msg);
-      const text = msg.body || '';
+  try {
+    const chat = await msg.getChat();
+    const isGroup = chat.isGroup;
+    if (!isGroup) return;
+
+    const chatId = msg.from;
+    const text = msg.body || '';
+    const isCommand = text.trim().startsWith('/');
+
+    // 🔹 [INSERIR AQUI — antes de qualquer if (muteMap.get(chatId))]
+    // 1) Desmutar deve funcionar mesmo em silêncio
+    if (isCommand && /^\/mute\s+off/i.test(text)) {
+      muteMap.delete(chatId);
+      return msg.reply('_voltei a falar 😉_');
+    }
+    if (isCommand && /^\/silencio\s+off/i.test(text)) {
+      muteMap.delete(chatId);
+      return msg.reply('_voltei a falar 😉_');
+    }
+
+    // 2) Se estiver mutado, sai (exceto os casos acima)
+    if (muteMap.get(chatId)) return;
+
+    // 3) Ativar mute
+    if (isCommand && /^\/mute\s+on/i.test(text)) {
+      muteMap.set(chatId, true);
+      return msg.reply('_ok, fico em silêncio até /mute off_');
+    }
+    if (isCommand && /^\/silencio\s+on/i.test(text)) {
+      muteMap.set(chatId, true);
+      return msg.reply('_ok, fico em silêncio até /mute off_');
+    }
+
+    // ... [resto do fluxo de comandos: setup, summary, etc.]
 
       // Upload
       if (msg.hasMedia && isGroup) {
