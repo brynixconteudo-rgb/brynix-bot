@@ -1,124 +1,100 @@
 // whatsapp.js
-// Bot WhatsApp Brynix: IA + Anexos → Google Drive + LOG no Sheets + watchdog.
-// Requer: GOOGLE_SA_JSON, GOOGLE_DRIVE_ROOT_FOLDER_ID, (opcional) LINKS_DB_PATH, ALERT_WEBHOOK_URL.
+// Cliente WhatsApp + integração com Google Sheets e Drive.
+// Funcionalidades:
+// - Em grupos: só responde se for mencionado ou se a mensagem começar com "/"
+// - /setup <sheetId|url> | <Project Name>
+// - /summary -> resumo do projeto via planilha
+// - Upload de anexos -> Google Drive do projeto
+//
+// Requer: ai.js, sheets.js, drive.js
+// Envs: LINKS_DB_PATH, GOOGLE_SA_JSON, OPENAI_API_KEY, ALERT_WEBHOOK_URL
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const { generateReply } = require('./ai');
-const { uploadBuffer } = require('./drive');
-const { appendLog } = require('./sheets');
+const fs = require("fs");
+const path = require("path");
+const { Client, LocalAuth } = require("whatsapp-web.js");
 
-// =====================
-// Configurações
-// =====================
-const SESSION_PATH = process.env.WA_SESSION_PATH || '/var/data/wa-session';
-const REINIT_COOLDOWN_MS = 30_000; // evitar loop de reinit
+const { generateReply } = require("./ai");
+const {
+  extractSheetId,
+  readProjectMeta,
+  readTasks,
+  buildStatusSummary,
+} = require("./sheets");
+const { uploadBufferToProject } = require("./drive");
+
+const SESSION_PATH = process.env.WA_SESSION_PATH || "/var/data/wa-session";
+const LINKS_DB_PATH = process.env.LINKS_DB_PATH || "/var/data/links-db.json";
+
+const REINIT_COOLDOWN_MS = 30_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 
-let currentState = 'starting';
-let lastQr = '';
-let reinitNotBefore = 0;
 let client;
-let selfId = null; // id do próprio bot (para detectar menções)
+let lastQr = "";
+let currentState = "starting";
+let reinitNotBefore = 0;
 
-// =====================
-// Utils
-// =====================
+// =============================
+// Persistência simples (links grupo -> planilha)
+// =============================
+function loadLinks() {
+  try {
+    return JSON.parse(fs.readFileSync(LINKS_DB_PATH, "utf8") || "{}");
+  } catch {
+    return {};
+  }
+}
+function saveLinks(obj) {
+  fs.mkdirSync(path.dirname(LINKS_DB_PATH), { recursive: true });
+  fs.writeFileSync(LINKS_DB_PATH, JSON.stringify(obj, null, 2));
+}
+function resolveProjectLink(chatId) {
+  return loadLinks()[chatId] || null;
+}
+function bindProjectLink(chatId, sheetId, projectName) {
+  const db = loadLinks();
+  db[chatId] = { sheetId, projectName, updatedAt: Date.now() };
+  saveLinks(db);
+}
+
+// =============================
+// Utilitários
+// =============================
 function getLastQr() {
   return lastQr;
 }
 
 async function sendAlert(payload) {
   const url = process.env.ALERT_WEBHOOK_URL;
-  if (!url) {
-    console.log('ℹ️ ALERT_WEBHOOK_URL não configurada; alerta:', payload);
-    return;
-  }
+  if (!url) return;
   try {
     const body =
-      typeof payload === 'string'
-        ? { text: payload }
-        : payload || { text: '⚠️ Alerta sem conteúdo' };
-
+      typeof payload === "string" ? { text: payload } : payload || { text: "⚠️ Alerta" };
     await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    console.log('🚨 Alerta enviado com sucesso.');
   } catch (err) {
-    console.error('❌ Erro ao enviar alerta para webhook:', err);
+    console.error("Erro ao enviar alerta:", err);
   }
 }
 
-/** Lê o mapeamento de grupo → sheetId de um JSON simples no disco (opcional). */
-function loadLinksDb() {
-  const p = process.env.LINKS_DB_PATH;
-  if (!p) return null;
-  try {
-    const raw = fs.readFileSync(p, 'utf8');
-    const json = JSON.parse(raw || '{}');
-    return json && typeof json === 'object' ? json : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Tenta resolver o sheetId para um chatId usando o arquivo de links e/ou env fallback. */
-function resolveSheetIdForChat(chatId) {
-  // 1) arquivo JSON { "<groupId>": "<sheetId>", ... }
-  const db = loadLinksDb();
-  if (db && db[chatId]) return db[chatId];
-
-  // 2) fallback “geral” (se você quiser um default temporário)
-  if (process.env.PROJECT_SHEET_ID) return process.env.PROJECT_SHEET_ID;
-
-  return null;
-}
-
-/** Reinicializa o cliente com cooldown. */
-async function safeReinit(reason = 'unknown') {
-  const now = Date.now();
-  if (now < reinitNotBefore) {
-    console.log(`[WA] Reinit ignorado (cooldown). Motivo: ${reason}`);
-    return;
-  }
-  reinitNotBefore = now + REINIT_COOLDOWN_MS;
-
-  try {
-    console.log(`[WA] Reinicializando cliente. Motivo: ${reason}`);
-    if (client) {
-      try { await client.destroy(); } catch (_) {}
-    }
-  } catch (err) {
-    console.error('[WA] Erro ao destruir cliente:', err);
-  }
-
-  client = buildClient();
-  wireEvents(client);
-  client.initialize();
-}
-
-// =====================
-// Client
-// =====================
 function buildClient() {
   return new Client({
     authStrategy: new LocalAuth({
-      clientId: 'brynix-bot',
+      clientId: "brynix-bot",
       dataPath: SESSION_PATH,
     }),
     puppeteer: {
       headless: true,
       timeout: 60_000,
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process",
       ],
     },
     restartOnAuthFail: true,
@@ -127,184 +103,214 @@ function buildClient() {
   });
 }
 
+async function safeReinit(reason = "unknown") {
+  const now = Date.now();
+  if (now < reinitNotBefore) return;
+  reinitNotBefore = now + REINIT_COOLDOWN_MS;
+
+  try {
+    if (client) await client.destroy();
+  } catch {}
+  client = buildClient();
+  wireEvents(client);
+  client.initialize();
+}
+
+async function shouldProcessMessage(msg) {
+  const isGroup = msg.from.endsWith("@g.us");
+  if (!isGroup) return true;
+
+  const body = (msg.body || "").trim();
+  if (body.startsWith("/")) return true;
+
+  try {
+    const mentions = await msg.getMentions();
+    const myWid = client?.info?.wid?._serialized;
+    if (mentions?.some((m) => m?.id?._serialized === myWid)) return true;
+  } catch {}
+  return false;
+}
+
+// =============================
+// Eventos
+// =============================
 function wireEvents(c) {
-  c.on('qr', (qr) => {
+  c.on("qr", (qr) => {
     lastQr = qr;
-    currentState = 'qr';
-    console.log('[WA] QR gerado. Abra /wa-qr para escanear.');
-    sendAlert('🔄 BOT Brynix requer novo pareamento: abra /wa-qr e escaneie o código.');
+    currentState = "qr";
+    console.log("[WA] QR gerado");
+    sendAlert("🔄 BOT requer novo pareamento. Escaneie o código.");
   });
 
-  c.on('authenticated', () => {
-    console.log('[WA] Autenticado');
+  c.on("ready", () => {
+    currentState = "ready";
+    console.log("[WA] Pronto ✅");
+    sendAlert("✅ BOT pronto.");
   });
 
-  c.on('auth_failure', (m) => {
-    console.error('[WA] Falha de autenticação:', m);
-    sendAlert(`⚠️ Falha de autenticação do BOT Brynix: ${m || 'motivo não informado'}`);
-    safeReinit('auth_failure');
+  c.on("auth_failure", (m) => {
+    console.error("Falha de auth:", m);
+    sendAlert("⚠️ Falha de auth: " + m);
+    safeReinit("auth_failure");
   });
 
-  c.on('ready', () => {
-    currentState = 'ready';
-    selfId = c.info?.wid?._serialized || null;
-    console.log('[WA] Cliente pronto ✅', selfId ? `(selfId: ${selfId})` : '');
-    sendAlert('✅ BOT Brynix online e pronto.');
+  c.on("disconnected", (r) => {
+    currentState = "disconnected";
+    console.error("Desconectado:", r);
+    sendAlert("❌ BOT desconectado: " + r);
+    safeReinit("disconnected:" + r);
   });
 
-  c.on('change_state', (state) => {
-    currentState = state || currentState;
-    console.log('[WA] Estado alterado:', currentState);
-  });
-
-  c.on('loading_screen', (percent, message) => {
-    console.log(`[WA] loading_screen: ${percent}% - ${message}`);
-  });
-
-  c.on('disconnected', (reason) => {
-    currentState = 'disconnected';
-    console.error('[WA] Desconectado:', reason);
-    sendAlert(`❌ BOT Brynix desconectado. Motivo: ${reason || 'não informado'}`);
-    safeReinit(`disconnected:${reason || 'unknown'}`);
-  });
-
-  // --------------------
   // Mensagens
-  // --------------------
-  c.on('message', async (msg) => {
+  c.on("message", async (msg) => {
     try {
-      const chat = await msg.getChat();
-      const isGroup = chat?.isGroup;
-      const authorName = msg._data?.notifyName || '';
+      if (!(await shouldProcessMessage(msg))) return;
 
-      // 1) ANEXOS → Drive + LOG
-      if (msg.hasMedia) {
-        try {
-          const media = await msg.downloadMedia(); // { data(base64), mimetype, filename }
-          if (media && media.data) {
-            const buffer = Buffer.from(media.data, 'base64');
-            const ext = (media.mimetype && media.mimetype.split('/')[1]) || 'bin';
-            const filename = (media.filename && media.filename.trim()) || `arquivo-${Date.now()}.${ext}`;
+      const body = (msg.body || "").trim();
+      const inGroup = msg.from.endsWith("@g.us");
 
-            const projectName = (isGroup && chat?.name) ? chat.name : 'Projeto';
-            const upload = await uploadBuffer({
-              projectName,
-              filename,
-              mimetype: media.mimetype,
-              buffer
-            });
-
-            // tenta registrar LOG no Sheets (se mapeado)
-            const sheetId = isGroup ? resolveSheetIdForChat(chat.id._serialized) : resolveSheetIdForChat(msg.from);
-            if (sheetId) {
-              try {
-                await appendLog(sheetId, {
-                  tipo: 'Upload',
-                  autor: authorName,
-                  mensagem: `Upload recebido no grupo "${projectName}"`,
-                  arquivo: filename,
-                  link: upload.webViewLink || upload.webContentLink || '',
-                  obs: ''
-                });
-              } catch (e) {
-                console.error('[LOG] Falha ao registrar no Sheets:', e?.message || e);
-              }
-            }
-
-            const link = upload.webViewLink || upload.webContentLink || '';
-            const confirm =
-              `📎 *Arquivo recebido*\n` +
-              `• Nome: ${filename}\n` +
-              (isGroup ? `• Projeto: ${projectName}\n` : '') +
-              (link ? `• Acesso: ${link}\n` : '• Acesso: (restrito ao Drive)\n') +
-              `\n✅ Salvo na pasta do mês do projeto.`;
-            await msg.reply(confirm);
-            console.log(`[WA] Upload ok (${filename}) ${link ? '→ link enviado' : ''}`);
-            // Não continua para IA se era só anexo:
-            return;
-          }
-        } catch (e) {
-          console.error('[WA] Erro ao processar anexo:', e);
-          await msg.reply('❌ Tive um problema ao salvar seu arquivo no Drive. Pode reenviar em instantes?');
+      // --- Comandos ---
+      if (body.startsWith("/")) {
+        if (body.toLowerCase().startsWith("/help")) {
+          await msg.reply(
+            "*Comandos*\n" +
+              "• /setup <sheetId|url> | <Nome do Projeto>\n" +
+              "• /summary → resumo do projeto\n" +
+              "• (Envie anexos mencionando o bot ou com /upload)"
+          );
           return;
         }
-      }
 
-      // 2) TEXTO → IA (regras de grupo x 1:1)
-      const body = (msg.body || '').trim();
-      const isCommand = body.startsWith('/');
-      let mentioned = false;
+        if (body.toLowerCase().startsWith("/setup")) {
+          const [idOrUrl, pNameRaw] = body
+            .slice(6)
+            .split("|")
+            .map((s) => (s || "").trim());
+          const sid = extractSheetId(idOrUrl);
+          if (!sid) {
+            await msg.reply("❌ Use: /setup <sheetId|url> | <Nome>");
+            return;
+          }
+          let projectName = pNameRaw || "";
+          try {
+            const meta = await readProjectMeta(sid);
+            if (!projectName) projectName = meta.ProjectName || "Projeto";
+          } catch {}
+          bindProjectLink(msg.from, sid, projectName);
+          await msg.reply(`✅ Vinculado!\nPlanilha: ${sid}\nNome: ${projectName}`);
+          return;
+        }
 
-      if (isGroup && selfId) {
-        try {
-          const mentions = await msg.getMentions();
-          mentioned = Array.isArray(mentions) && mentions.some(m => m.id?._serialized === selfId);
-        } catch (_) {}
-      }
+        if (body.toLowerCase().startsWith("/summary")) {
+          const link = resolveProjectLink(msg.from);
+          if (!link?.sheetId) {
+            await msg.reply("❌ Grupo sem planilha vinculada. Use /setup.");
+            return;
+          }
+          const tasks = await readTasks(link.sheetId);
+          const resumo = buildStatusSummary(link.projectName, tasks);
+          await msg.reply(resumo);
+          return;
+        }
 
-      // Em grupo: só responde se for mencionado ou comando:
-      if (isGroup && !isCommand && !mentioned) {
-        // silencia para não poluir conversa
+        if (body.toLowerCase().startsWith("/upload")) {
+          if (!msg.hasMedia) {
+            await msg.reply("❌ Envie um anexo junto com /upload.");
+            return;
+          }
+          await handleMediaUpload(msg);
+          return;
+        }
+
+        await msg.reply("🤖 Comando não reconhecido. Use /help.");
         return;
       }
 
-      // Chama IA
+      // --- Upload direto ---
+      if (msg.hasMedia) {
+        await handleMediaUpload(msg);
+        return;
+      }
+
+      // --- Conversa IA ---
       const reply = await generateReply(body, {
         from: msg.from,
-        pushName: authorName,
-        isGroup,
-        groupName: isGroup ? chat?.name : undefined
+        pushName: msg._data?.notifyName,
       });
-
       await msg.reply(reply);
-      console.log(`[WA] Resposta (IA) enviada para ${msg.from}: "${(reply || '').slice(0, 120)}..."`);
     } catch (err) {
-      console.error('[WA] Erro ao processar mensagem:', err);
-      try { await msg.reply('Tive um problema técnico agora há pouco. Pode reenviar sua mensagem?'); } catch (_) {}
-      sendAlert(`❗ Erro ao responder mensagem: ${err?.message || err}`);
+      console.error("Erro handler:", err);
+      try {
+        await msg.reply("❌ Problema técnico. Pode reenviar?");
+      } catch {}
     }
   });
+
+  // Upload helper
+  async function handleMediaUpload(msg) {
+    try {
+      const link = resolveProjectLink(msg.from);
+      if (!link?.sheetId) {
+        await msg.reply("❌ Grupo sem planilha vinculada. Use /setup.");
+        return;
+      }
+      const meta = await readProjectMeta(link.sheetId);
+      const projectName = link.projectName || meta.ProjectName || "Projeto";
+
+      const media = await msg.downloadMedia();
+      const buffer = Buffer.from(media.data, "base64");
+      const filename = media.filename || `anexo_${Date.now()}`;
+      const mime = media.mimetype || "application/octet-stream";
+
+      const uploaded = await uploadBufferToProject(
+        buffer,
+        filename,
+        mime,
+        projectName,
+        "Anexos"
+      );
+
+      await msg.reply(
+        `✅ Arquivo salvo em *${projectName}*.\n` +
+          `🔗 ${uploaded.webViewLink || uploaded.webContentLink || "Link indisponível"}`
+      );
+    } catch (e) {
+      console.error("Upload falhou:", e);
+      await msg.reply("❌ Não consegui salvar no Drive.");
+    }
+  }
 }
 
-// =====================
-// Inicialização pública
-// =====================
+// =============================
+// Inicialização
+// =============================
 function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
 
-  // Health
   if (app && app.get) {
-    app.get('/wa-status', async (_req, res) => {
+    app.get("/wa-status", async (_req, res) => {
       let state = currentState;
       try {
         const s = await client.getState().catch(() => null);
         if (s) state = s;
-      } catch (_) {}
+      } catch {}
       res.json({ status: state });
     });
   }
 
   client.initialize();
 
-  // Watchdog
   setInterval(async () => {
     try {
       const s = await client.getState().catch(() => null);
-      if (!s || s === 'CONFLICT' || s === 'UNPAIRED' || s === 'UNLAUNCHED') {
-        console.log(`[WA] Watchdog: estado crítico (${s || 'null'}) → reinit`);
-        sendAlert(`⏰ Watchdog: estado do BOT é "${s || 'null'}". Tentando reinicializar.`);
-        safeReinit(`watchdog:${s || 'null'}`);
-      } else if (currentState !== 'ready' && s === 'CONNECTED') {
-        currentState = 'ready';
-      } else {
-        console.log(`[WA] Estado ok (${s || currentState})`);
+      if (!s || ["CONFLICT", "UNPAIRED", "UNLAUNCHED"].includes(s)) {
+        safeReinit("watchdog:" + s);
       }
     } catch (err) {
-      console.error('[WA] Watchdog erro:', err);
-      safeReinit('watchdog-error');
+      safeReinit("watchdog-error");
     }
   }, WATCHDOG_INTERVAL_MS);
 }
 
-module.exports = { initWhatsApp, getLastQr };
+module.exports = { initWhatsApp, getLastQr, resolveProjectLink };
