@@ -1,59 +1,157 @@
 // ai.js
-// Camada de IA: tom executivo, direto, cordial, com humor leve.
-// Mantém foco em BRYNIX; evita virar enciclopédia geral.
-// Para perguntas fora do escopo, redireciona com elegância.
-
 const OpenAI = require('openai');
 
-const API_KEY = process.env.OPENAI_API_KEY || '';
-if (!API_KEY) {
-  console.error('[AI] OPENAI_API_KEY ausente nas variáveis de ambiente.');
-}
-const client = new OpenAI({ apiKey: API_KEY });
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-// Modelo: pode trocar via variável AI_MODEL no Render.
-const MODEL = (process.env.AI_MODEL || 'gpt-4o-mini').trim();
-
-// Prompt base (curto) — o restante vem do user/system dinamicamente.
-const SYSTEM_PROMPT = `
-Você é o **Assistente BRYNIX**.
-
-Estilo: executivo, claro, cordial, com leve humor.
-Regra de ouro: sempre que possível, traga utilidade prática (próximos passos, checklist,
-sugestões objetivas). Evite respostas longas demais se não agregarem valor.
-
-Escopo prioridade: BRYNIX (empresa, ofertas, automações, projetos, metodologia, exemplos),
-organização de atividades de projeto e comunicação com cliente.
-Se a pergunta estiver claramente fora desse escopo (ex.: cultura pop antiga, curiosidades aleatórias),
-redirecione com elegância: explique que o foco é BRYNIX e projetos, e faça uma ponte útil.
-`;
-
-function buildUserPrompt(userText, ctx = {}) {
-  const who = ctx.pushName || ctx.from || 'usuário';
-  return `Mensagem de ${who}: "${userText}"`;
+// ---------- helpers de formatação ----------
+function asMenu(triggers = []) {
+  const gatilhosVisiveis = triggers.filter(t => t.startsWith('/'));
+  return [
+    '📋 *Menu rápido*',
+    '— Use @bot ou um dos comandos abaixo no grupo.',
+    '',
+    `• */status* — visão geral do projeto (mock)`,
+    `• */tarefas* — tarefas do dia (mock)`,
+    `• */hoje* — lembretes do dia (mock)`,
+    `• */ajuda* — este menu`,
+    '',
+    gatilhosVisiveis.length
+      ? `Gatilhos ativos: ${gatilhosVisiveis.join(', ')}`
+      : ''
+  ].join('\n');
 }
 
+function mockStatus() {
+  return [
+    '📊 *Status (mock)*',
+    'Projeto: _Pendente de vinculação à planilha_',
+    'Fase atual: Descoberta/Assessment',
+    'Entregas foco: mapeamento de dados, entrevistas, quick wins',
+    'Riscos: definição de fontes de dados e acesso a sistemas',
+    'Próximos passos: validar planilha fonte, conectar Sheets ao bot',
+  ].join('\n');
+}
+
+function mockTarefas() {
+  return [
+    '🗓️ *Tarefas de hoje (mock)*',
+    '• Rafael — Consolidar checklist de documentos (P)',
+    '• Sueli — Validar agenda de entrevistas (M)',
+    '• Paulo — Criar planilha base do projeto no GDrive (A)',
+    '_Obs.: assim que conectarmos à planilha, estes dados virão de fonte real._',
+  ].join('\n');
+}
+
+function mockHoje() {
+  return [
+    '⏰ *Lembretes de hoje (mock)*',
+    '• 10:00 — Checagem de pendências do checklist',
+    '• 16:30 — Alinhamento rápido com time comercial',
+    '_Quando a planilha estiver conectada, horários e itens virão dela._',
+  ].join('\n');
+}
+
+// ---------- system prompt ----------
+function buildSystem(isGroup, botName) {
+  // Contexto institucional mínimo — enxuto, sem “palestra”
+  const brynix = [
+    'Você é o Assistente BRYNIX.',
+    'Missão: acelerar resultados com IA prática para PMEs, com foco em eficiência gerencial, automação e geração de receita.',
+    'Estilo: executivo, claro, cordial; objetivo por padrão; use bom humor leve quando adequado.',
+  ].join(' ');
+
+  const regrasGrupo = [
+    'No *grupo*: seja breve e prático.',
+    'Só responda se acionado por menção (@) ou comando (/), pois a orquestração já filtra.',
+    'Mantenha o foco no projeto; se a pergunta fugir do escopo, responda rapidamente e convide a usar `/ajuda` para opções.',
+  ].join(' ');
+
+  const regrasPrivado = [
+    'No *1:1*: pode expandir um pouco, ainda assim seja objetivo.',
+  ].join(' ');
+
+  const limites = [
+    'Se não souber, diga o que precisa para responder.',
+    'Evite inventar nomes de pessoas, projetos ou números.',
+  ].join(' ');
+
+  return [
+    `Nome do bot: ${botName || 'Brynix Bot'}.`,
+    brynix,
+    isGroup ? regrasGrupo : regrasPrivado,
+    limites,
+  ].join('\n');
+}
+
+// ---------- tratadores de comandos (/...) ----------
+async function handleSlashCommand(text, ctx) {
+  const cmd = text.trim().split(/\s+/)[0].toLowerCase();
+
+  switch (cmd) {
+    case '/ajuda':
+      return asMenu(ctx.triggers || []);
+    case '/status':
+      return mockStatus();
+    case '/tarefas':
+      return mockTarefas();
+    case '/hoje':
+      return mockHoje();
+    default:
+      // volta um help rápido
+      return `Comando não reconhecido. Use */ajuda* para ver opções.`;
+  }
+}
+
+// ---------- geração principal ----------
 async function generateReply(userText, ctx = {}) {
   try {
+    const { isGroup, botName, triggers } = ctx;
+    const text = (userText || '').trim();
+
+    // comandos têm prioridade
+    if (text.startsWith('/')) {
+      return await handleSlashCommand(text, { isGroup, botName, triggers });
+    }
+
+    const system = buildSystem(!!isGroup, botName);
+
     const messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: buildUserPrompt(userText, ctx) },
+      { role: 'system', content: system },
+      {
+        role: 'user',
+        content: [
+          `Contexto: ${isGroup ? 'grupo de projeto' : 'conversa 1:1'}.`,
+          'Se a pergunta for fora de escopo em grupo, responda curto e convide a usar /ajuda.',
+          `Gatilhos disponíveis: ${(triggers || []).join(', ') || '(nenhum informado)'}.`,
+          '',
+          `Pergunta: "${text}"`,
+        ].join('\n')
+      }
     ];
 
     const resp = await client.chat.completions.create({
-      model: MODEL,
+      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+      temperature: isGroup ? 0.4 : 0.5,
+      max_tokens: isGroup ? 220 : 320,
       messages,
-      temperature: 0.5,
-      max_tokens: 550,
     });
 
-    const out =
-      resp?.choices?.[0]?.message?.content?.trim() ||
-      'Certo! Consegue me dar um pouco mais de contexto para eu te ajudar melhor?';
-    return out;
+    let out = (resp.choices?.[0]?.message?.content || '').trim();
+
+    // Em grupo, garanta concisão
+    if (isGroup) {
+      // Se a resposta ficou muito longa, dá uma versão resumida
+      if (out.length > 600) {
+        out = out.slice(0, 580) + '…';
+      }
+    }
+
+    return out || 'Ok.';
   } catch (err) {
-    console.error('[AI] Erro na OpenAI:', err?.message || err);
-    return 'Tive um problema técnico com a IA agora há pouco. Pode reenviar sua mensagem?';
+    console.error('[AI] Erro generateReply:', err);
+    return 'Tive um problema técnico agora. Pode repetir em poucas palavras?';
   }
 }
 
