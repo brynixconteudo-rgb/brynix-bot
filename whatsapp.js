@@ -1,5 +1,5 @@
 // whatsapp.js
-const { Client, LocalAuth, Buttons, List } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
 const { generateReply } = require('./ai');
@@ -16,104 +16,92 @@ let lastQr = '';
 let reinitNotBefore = 0;
 let client;
 
-// estado
-const muteMap = new Map();       // chatId -> boolean
-const linkMap = new Map();       // chatId -> { sheetId, projectName }
+const muteMap = new Map();   // chatId -> boolean
+const linkMap = new Map();   // chatId -> { sheetId, projectName }
 
-// helpers visuais
+// helpers simples de formatação
 const B = (s) => `*${s}*`;
 const I = (s) => `_${s}_`;
 const OK = '✅';
 const WARN = '⚠️';
 const NO = '❌';
 
-// util de fatiar mensagens longas
+// quebra mensagens longas
 function chunkText(text, limit = 3500) {
   if (!text) return [''];
-  const parts = [];
-  for (let i = 0; i < text.length; i += limit) parts.push(text.slice(i, i + limit));
-  return parts;
+  const chunks = [];
+  for (let i = 0; i < text.length; i += limit) chunks.push(text.slice(i, i + limit));
+  return chunks;
 }
 async function safeReply(msg, text) {
   for (const part of chunkText(text)) await msg.reply(part);
 }
 
+// ===== Cards =====
 function helpCard(projectName) {
   const title = projectName ? `${projectName} — Assistente de Projeto` : 'Assistente de Projeto';
   return [
     `${B(title)}`,
     '',
     `${B('Como falar comigo')}`,
-    '• No grupo: me mencione (@BOT) e fale natural.',
-    '  Ex.: @BOT resumo curto  •  @BOT o que vence hoje?',
+    `• No grupo: me mencione (@BOT) e fale natural.`,
+    `  Ex.: @BOT o que vence hoje?  •  @BOT resumo curto`,
     '',
     `${B('Atalhos')}`,
-    '• /menu — menu com botões',
-    '• /summary — resumo completo',
-    '• /next — próximos (hoje/amanhã)',
-    '• /late — atrasadas (top 8)',
-    '• /remind now — dispara lembrete agora',
-    '• /note <texto> — registra nota',
-    '• /who — participantes',
-    '• /mute on | /mute off — silêncio do bot',
+    `• /summary — resumo completo`,
+    `• /next — próximos (hoje/amanhã)`,
+    `• /late — atrasadas (top 8)`,
+    `• /remind now — dispara lembrete agora`,
+    `• /note <texto> — registra nota`,
+    `• /who — participantes`,
+    `• /mute on | /mute off — silêncio do bot`,
     '',
     I('Dica: envie anexos mencionando o bot; eu salvo no Drive do projeto.'),
   ].join('\n');
 }
 
-// ========= Menu interativo =========
-async function sendMenuWithButtons(msg, link) {
-  const title = link?.projectName
-    ? `${link.projectName} — Menu`
-    : 'Assistente de Projeto — Menu';
-  const body = 'Escolha uma opção:';
-  const footer = 'Dica: você pode me mencionar e pedir em linguagem natural.';
-
-  const buttons = new Buttons(
-    body,
-    [
-      { body: 'Resumo' },
-      { body: 'Próximos' },
-      { body: 'Atrasadas' },
-      { body: 'Silenciar' },
-      { body: 'Voltar a falar' },
-    ],
-    title,
-    footer
-  );
-
-  try {
-    await msg.getChat().then(c => c.sendMessage(buttons));
-  } catch (e) {
-    // fallback em texto
-    await safeReply(msg, helpCard(link?.projectName));
-  }
+// Novo: MENU em texto (sem botões)
+function menuCard(projectName) {
+  const t = projectName ? `${projectName} — Assistente de Projeto` : 'Assistente de Projeto';
+  return [
+    `*${t}*`,
+    ``,
+    `*Como falar comigo*`,
+    `• No grupo: me mencione (@BOT) e fale natural.`,
+    `  Ex.: @BOT resumo curto  •  @BOT o que vence hoje?`,
+    ``,
+    `*Atalhos*`,
+    `• /summary — resumo completo`,
+    `• /next — próximos (hoje/amanhã)`,
+    `• /late — atrasadas (top 8)`,
+    `• /remind now — dispara lembrete agora`,
+    `• /note <texto> — registra nota`,
+    `• /who — participantes`,
+    `• /mute on | /mute off — silêncio do bot`,
+    ``,
+    `_Dica: envie anexos me mencionando; eu salvo no Drive do projeto._`,
+  ].join('\n');
 }
 
-// ========= Acesso a QR/alertas =========
 function getLastQr() { return lastQr; }
 
 async function sendAlert(payload) {
   const url = process.env.ALERT_WEBHOOK_URL;
   if (!url) { console.log('ℹ️ ALERT_WEBHOOK_URL não configurada; alerta:', payload); return; }
   try {
-    const body = (typeof payload === 'string') ? { text: payload } : (payload || { text: '⚠️ Alerta' });
+    const body = typeof payload === 'string' ? { text: payload } : payload || { text: '⚠️ Alerta sem conteúdo' };
     await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   } catch (err) { console.error('❌ Webhook erro:', err); }
 }
 
-// ========= Cliente =========
 function buildClient() {
   return new Client({
     authStrategy: new LocalAuth({ clientId: 'brynix-bot', dataPath: SESSION_PATH }),
     puppeteer: {
-      headless: true,
-      timeout: 60_000,
+      headless: true, timeout: 60_000,
       args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process']
     },
-    restartOnAuthFail: true,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 5_000,
+    restartOnAuthFail: true, takeoverOnConflict: true, takeoverTimeoutMs: 5_000,
   });
 }
 
@@ -121,37 +109,26 @@ async function safeReinit(reason = 'unknown') {
   const now = Date.now();
   if (now < reinitNotBefore) return;
   reinitNotBefore = now + REINIT_COOLDOWN_MS;
-  try { if (client) { try { await client.destroy(); } catch(_){} } } catch(_) {}
-  client = buildClient();
-  wireEvents(client);
-  client.initialize();
+  try { if (client) try { await client.destroy(); } catch(_){} } catch(e){}
+  client = buildClient(); wireEvents(client); client.initialize();
 }
 
-// ========= Estado de projeto por grupo =========
 function setProjectLink(chatId, sheetId, projectName) { linkMap.set(chatId, { sheetId, projectName }); }
 function getProjectLink(chatId) { return linkMap.get(chatId) || null; }
-
-// ========= Regras auxiliares =========
+function isGroupMsg(msg) { return msg.from.endsWith('@g.us'); }
 function wasBotMentioned(msg) {
-  const mentioned = (msg.mentionedIds && msg.mentionedIds.length > 0);
   const txt = (msg.body || '').toLowerCase();
-  // heurística simples
-  return mentioned || /\b(bot|brynix)\b/.test(txt);
+  const hasAt = txt.includes('@');
+  const hasPush = msg._data?.notifyName ? txt.includes((msg._data.notifyName||'').toLowerCase()) : false;
+  return (msg.mentionedIds && msg.mentionedIds.length > 0) || hasAt || hasPush;
 }
 
-function parseDateBR(s) {
-  const m = (s || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-  if (!m) return null;
-  const d = +m[1], mo = +m[2]-1, y = +m[3] + (m[3].length===2?2000:0);
-  return new Date(y, mo, d);
-}
-
-// ========= Handlers GP =========
+// ===== Handlers GP =====
 async function handleSummaryComplete(msg, link) {
   try {
     const tasks = await readTasks(link.sheetId);
     const card = buildStatusSummary(link.projectName, tasks);
-    await safeReply(msg, card + `\n${I('Dica: abra o menu com /menu ou “@BOT menu”.')}`);
+    await safeReply(msg, card + `\n${I('Dica: @BOT resumo curto  •  /help')}`);
   } catch (e) { console.error(e); await msg.reply(`${NO} Não consegui ler a planilha.`); }
 }
 
@@ -171,10 +148,17 @@ async function handleSummaryBrief(msg, link) {
       `Total de tarefas: ${total}`,
       top,
       `Atrasadas: ${atrasadas}`,
-      I('Dica: “@BOT resumo completo” ou /summary.')
+      I('Dica: @BOT resumo completo  •  /summary')
     ].join('\n');
     await safeReply(msg, txt);
   } catch (e) { console.error(e); await msg.reply(`${NO} Não consegui gerar o resumo curto.`); }
+}
+
+function parseDateBR(s) {
+  const m = (s || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (!m) return null;
+  const d = +m[1], mo = +m[2]-1, y = +m[3] + (m[3].length===2?2000:0);
+  return new Date(y, mo, d);
 }
 
 async function handleNext(msg, link) {
@@ -208,21 +192,22 @@ async function handleRemindNow(msg, link) { await handleSummaryComplete(msg, lin
 
 async function handleNote(msg, link, noteText) {
   if (!noteText) return msg.reply(`${WARN} Escreva a nota: /note <texto>`);
-  try { await msg.reply(`${OK} Nota registrada: ${noteText}`); }  // aqui pluga num appendLog se quiser
+  try { await msg.reply(`${OK} Nota registrada: ${noteText}`); }  // plugue no seu appendLog se quiser
   catch (e) { console.error(e); await msg.reply(`${NO} Não consegui registrar a nota agora.`); }
 }
 
-async function handleWho(msg, _link) {
+async function handleWho(msg, link) {
   const txt = [
-    `${B('Participantes do grupo')}`,
-    I('Em breve: “@BOT pendências do <nome>”.')
+    `${B(`${link.projectName} — Membros do grupo`)}`,
+    `• ${I('Baseado nos participantes do WhatsApp')}`,
+    I('Dica: em breve — “@BOT pendências da <pessoa>”.')
   ].join('\n');
   await safeReply(msg, txt);
 }
 
 async function handleHelp(msg, link) { await safeReply(msg, helpCard(link?.projectName)); }
 
-// ========= Eventos / Router =========
+// ===== Wire & Router =====
 function wireEvents(c) {
   c.on('qr', (qr) => { lastQr = qr; currentState='qr'; console.log('[WA] QR gerado'); });
   c.on('authenticated', ()=> console.log('[WA] Autenticado'));
@@ -233,102 +218,105 @@ function wireEvents(c) {
   c.on('message', async (msg) => {
     try {
       const chat = await msg.getChat();
-      if (!chat.isGroup) {
-        // 1:1 → IA atual
-        const reply = await generateReply(msg.body || '', { from: msg.from, pushName: msg._data?.notifyName });
-        return safeReply(msg, reply);
-      }
+      const isGroup = chat.isGroup;
+      if (!isGroup) return;
 
-      const chatId = msg.from;
-      const text = (msg.body || '').trim();
-      const isCommand = text.startsWith('/');
+      const chatId  = msg.from;
+      const text    = msg.body || '';
+      const isCommand = text.trim().startsWith('/');
 
-      // 1) desmutar funciona mesmo em silêncio
-      if (isCommand && /^\/(mute|silencio)\s*off\b/i.test(text)) {
+      // 1) Desmutar deve funcionar mesmo em silêncio
+      if (isCommand && /^\/mute\s*off/i.test(text)) {
         muteMap.delete(chatId);
-        return msg.reply(I('voltei a falar 😉'));
+        return msg.reply('_voltei a falar 😉_');
+      }
+      if (isCommand && /^\/silencio\s*off/i.test(text)) {
+        muteMap.delete(chatId);
+        return msg.reply('_voltei a falar 😉_');
       }
 
-      // 2) se estiver mutado, sai (exceto off acima)
+      // 2) Se estiver mutado, sai (exceto os casos acima)
       if (muteMap.get(chatId)) return;
 
-      // 3) ativar mute (on)
-      if (isCommand && /^\/(mute|silencio)\s*on\b/i.test(text)) {
+      // 3) Ativar mute
+      if (isCommand && /^\/mute\s*on/i.test(text)) {
         muteMap.set(chatId, true);
-        return msg.reply(I('ok, fico em silêncio até /mute off'));
+        return msg.reply('_ok, fico em silêncio até /mute off_');
+      }
+      if (isCommand && /^\/silencio\s*on/i.test(text)) {
+        muteMap.set(chatId, true);
+        return msg.reply('_ok, fico em silêncio até /mute off_');
       }
 
-      // 4) comandos de menu explícitos SEMPRE abrem botões
-      const mentionAskedMenu = wasBotMentioned(msg) && /\b(menu|ajuda|help)\b/i.test(text);
-      const isMenuCmd = isCommand && /^\/(menu|help)\b/i.test(text);
-      if (isMenuCmd || mentionAskedMenu) {
+      // === MENU texto (sem botões) — responde cedo ===
+      if (isCommand && /^\/menu/i.test(text)) {
         const link = getProjectLink(chatId);
-        return sendMenuWithButtons(msg, link);
+        return safeReply(msg, menuCard(link?.projectName));
+      }
+      if (!isCommand && wasBotMentioned(msg) && /\b(menu|ajuda|help)\b/i.test(text)) {
+        const link = getProjectLink(chatId);
+        return safeReply(msg, menuCard(link?.projectName));
       }
 
-      // 5) upload de mídia → Drive
-      if (msg.hasMedia) {
+      // === Upload de mídia (Drive) ===
+      if (msg.hasMedia && isGroup) {
         const link = getProjectLink(chatId);
         if (!link) return msg.reply(`${WARN} Vincule o projeto: /setup <sheetId|url> | <Nome>`);
         try {
           const res = await saveIncomingMediaToDrive(c, msg, link);
           if (res?.url) return safeReply(msg, `${OK} Arquivo salvo em ${B(link.projectName)}.\n🔗 ${res.url}`);
           return msg.reply(`${NO} Não consegui salvar no Drive.`);
-        } catch(e){ console.error(e); return msg.reply(`${NO} Não consegui salvar no Drive.`); }
+        } catch (e) {
+          console.error(e);
+          return msg.reply(`${NO} Não consegui salvar no Drive.`);
+        }
       }
 
-      // 6) demais comandos/intenções
+      // === Comandos e NLU ===
+      // precisa haver um projeto vinculado para os comandos abaixo
       const mentioned = wasBotMentioned(msg);
       if (!isCommand && !mentioned) return;
 
-      // setup
-      if (isCommand && /^\/setup\b/i.test(text)) {
+      // /setup
+      if (isCommand && /^\/setup/i.test(text)) {
         const parts = text.split('|');
-        const sheetRaw = (parts[0]||'').replace(/\/setup/i,'').trim();
+        const sheetRaw    = (parts[0]||'').replace(/\/setup/i,'').trim();
         const projectName = (parts[1]||'').trim();
         const sheetId = extractSheetId(sheetRaw);
         if (!sheetId || !projectName) {
           return msg.reply(`${WARN} Use: /setup <sheetId|url> | <Nome do Projeto>`);
         }
         setProjectLink(chatId, sheetId, projectName);
-        await safeReply(msg, `${OK} ${B('Projeto vinculado!')}\n• Planilha: ${sheetId}\n• Nome: ${projectName}`);
-        return sendMenuWithButtons(msg, { sheetId, projectName }); // abre o menu depois do setup
+        return safeReply(msg, `${OK} ${B('Projeto vinculado!')}\n• Planilha: ${sheetId}\n• Nome: ${projectName}`);
       }
 
-      // mapeamento NLU
       const link = getProjectLink(chatId);
       if (!link) return msg.reply(`${WARN} Vincule o projeto: /setup <sheetId|url> | <Nome>`);
 
-      // atalhos simples por texto dos botões
-      if (/^resumo$/i.test(text)) return handleSummaryComplete(msg, link);
-      if (/^próximos$/i.test(text) || /^proximos$/i.test(text)) return handleNext(msg, link);
-      if (/^atrasadas$/i.test(text)) return handleLate(msg, link);
-      if (/^silenciar$/i.test(text)) { muteMap.set(chatId, true); return msg.reply(I('ok, fico em silêncio até /mute off')); }
-      if (/^voltar a falar$/i.test(text)) { muteMap.delete(chatId); return msg.reply(I('voltei a falar 😉')); }
-
+      // NLU
       const nlu = parseNLU(text);
       switch (nlu.intent) {
-        case INTENTS.HELP: return sendMenuWithButtons(msg, link);
-        case INTENTS.SUMMARY:
-        case INTENTS.SUMMARY_FULL: return handleSummaryComplete(msg, link);
+        case INTENTS.HELP:          return handleHelp(msg, link);
+        case INTENTS.MENU:          return safeReply(msg, menuCard(link?.projectName));
+        case INTENTS.SUMMARY:       return handleSummaryComplete(msg, link);
         case INTENTS.SUMMARY_BRIEF: return handleSummaryBrief(msg, link);
-        case INTENTS.NEXT: return handleNext(msg, link);
-        case INTENTS.LATE: return handleLate(msg, link);
-        case INTENTS.REMIND_NOW: return handleRemindNow(msg, link);
-        case INTENTS.NOTE: return handleNote(msg, link, nlu.note);
-        case INTENTS.WHO: return handleWho(msg, link);
-        case INTENTS.MUTE_ON: muteMap.set(chatId,true); return msg.reply(I('ok, fico em silêncio até /mute off'));
-        case INTENTS.MUTE_OFF: muteMap.delete(chatId); return msg.reply(I('voltei a falar 😉'));
-        default: return sendMenuWithButtons(msg, link); // sempre devolve o menu
+        case INTENTS.SUMMARY_FULL:  return handleSummaryComplete(msg, link);
+        case INTENTS.NEXT:          return handleNext(msg, link);
+        case INTENTS.LATE:          return handleLate(msg, link);
+        case INTENTS.REMIND_NOW:    return handleRemindNow(msg, link);
+        case INTENTS.NOTE:          return handleNote(msg, link, nlu.note);
+        case INTENTS.WHO:           return handleWho(msg, link);
+        case INTENTS.MUTE_ON:       muteMap.set(chatId,true);  return msg.reply(I('ok, fico em silêncio até /mute off'));
+        case INTENTS.MUTE_OFF:      muteMap.delete(chatId);    return msg.reply(I('voltei a falar 😉'));
+        default:                    return handleHelp(msg, link);
       }
     } catch (err) {
       console.error('[WA] erro msg:', err);
-      try { await msg.reply('Dei uma engasgada técnica aqui. Pode reenviar?'); } catch(_) {}
+      try { await msg.reply('Tive uma engasgada técnica aqui. Pode reenviar?'); } catch (_) {}
     }
   });
 }
 
-// ========= Inicialização =========
 function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
@@ -350,16 +338,11 @@ function initWhatsApp(app) {
   }
 
   client.initialize();
-
   setInterval(async ()=>{
     try {
       const s = await client.getState().catch(()=>null);
-      if (!s || ['CONFLICT','UNPAIRED','UNLAUNCHED'].includes(s)) {
-        sendAlert(`⏰ Watchdog: estado "${s || 'null'}". Reinicializando.`);
-        safeReinit(`watchdog:${s||'null'}`);
-      } else if (currentState!=='ready' && s==='CONNECTED') {
-        currentState = 'ready';
-      }
+      if (!s || ['CONFLICT','UNPAIRED','UNLAUNCHED'].includes(s)) safeReinit(`watchdog:${s||'null'}`);
+      else if (currentState!=='ready' && s==='CONNECTED') currentState = 'ready';
     } catch(e){ safeReinit('watchdog-error'); }
   }, WATCHDOG_INTERVAL_MS);
 }
