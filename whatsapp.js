@@ -16,15 +16,18 @@ let lastQr = '';
 let reinitNotBefore = 0;
 let client;
 
+// Mapa de estado de silêncio e de vínculo com planilha
 const muteMap = new Map();   // chatId -> boolean
 const linkMap = new Map();   // chatId -> { sheetId, projectName }
 
+// helpers de formatação
 const B = (s) => `*${s}*`;
 const I = (s) => `_${s}_`;
 const OK = '✅';
 const WARN = '⚠️';
 const NO = '❌';
 
+// respostas longas em partes
 function chunkText(text, limit = 3500) {
   if (!text) return [''];
   const chunks = [];
@@ -33,6 +36,7 @@ function chunkText(text, limit = 3500) {
 }
 async function safeReply(msg, text) { for (const part of chunkText(text)) await msg.reply(part); }
 
+// cartão /help
 function helpCard(projectName) {
   const title = projectName ? `${projectName} — Assistente de Projeto` : 'Assistente de Projeto';
   return [
@@ -45,7 +49,7 @@ function helpCard(projectName) {
     `${B('Atalhos')}`,
     `• /summary — resumo completo`,
     `• /next — próximos (hoje/amanhã)`,
-    `• /late — atrasadas (top 5/8)`,
+    `• /late — atrasadas (top 8)`,
     `• /remind now — dispara lembrete agora`,
     `• /note <texto> — registra nota`,
     `• /who — quem está no projeto`,
@@ -57,6 +61,7 @@ function helpCard(projectName) {
 
 function getLastQr() { return lastQr; }
 
+// (opcional) webhook de alerta
 async function sendAlert(payload) {
   const url = process.env.ALERT_WEBHOOK_URL;
   if (!url) { console.log('ℹ️ ALERT_WEBHOOK_URL não configurada; alerta:', payload); return; }
@@ -66,27 +71,42 @@ async function sendAlert(payload) {
   } catch (err) { console.error('❌ Webhook erro:', err); }
 }
 
+// construção do cliente
 function buildClient() {
   return new Client({
     authStrategy: new LocalAuth({ clientId: 'brynix-bot', dataPath: SESSION_PATH }),
     puppeteer: {
-      headless: true, timeout: 60_000,
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process']
+      headless: true,
+      timeout: 60_000,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process',
+      ],
     },
-    restartOnAuthFail: true, takeoverOnConflict: true, takeoverTimeoutMs: 5_000,
+    restartOnAuthFail: true,
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 5_000,
   });
 }
 
+// reinit com cooldown
 async function safeReinit(reason = 'unknown') {
   const now = Date.now();
   if (now < reinitNotBefore) return;
   reinitNotBefore = now + REINIT_COOLDOWN_MS;
-  try { if (client) try { await client.destroy(); } catch(_){} } catch(e){}
+  try { if (client) try { await client.destroy(); } catch (_) {} } catch (_) {}
   client = buildClient(); wireEvents(client); client.initialize();
 }
 
+// vínculo com planilha
 function setProjectLink(chatId, sheetId, projectName) { linkMap.set(chatId, { sheetId, projectName }); }
 function getProjectLink(chatId) { return linkMap.get(chatId) || null; }
+
+// utilitários de contexto
 function isGroupMsg(msg) { return msg.from.endsWith('@g.us'); }
 function wasBotMentioned(msg) {
   const txt = (msg.body || '').toLowerCase();
@@ -95,13 +115,16 @@ function wasBotMentioned(msg) {
   return (msg.mentionedIds && msg.mentionedIds.length > 0) || hasAt || hasPush;
 }
 
-// ------- Handlers GP -------
+// ===== Handlers do GP =====
 async function handleSummaryComplete(msg, link) {
   try {
     const tasks = await readTasks(link.sheetId);
     const card = buildStatusSummary(link.projectName, tasks);
     await safeReply(msg, card + `\n${I('Dica: @BOT resumo curto  •  /help')}`);
-  } catch (e) { console.error(e); await msg.reply(`${NO} Não consegui ler a planilha.`); }
+  } catch (e) {
+    console.error(e);
+    await msg.reply(`${NO} Não consegui ler a planilha.`);
+  }
 }
 
 async function handleSummaryBrief(msg, link) {
@@ -123,7 +146,10 @@ async function handleSummaryBrief(msg, link) {
       I('Dica: @BOT resumo completo  •  /summary')
     ].join('\n');
     await safeReply(msg, txt);
-  } catch (e) { console.error(e); await msg.reply(`${NO} Não consegui gerar o resumo curto.`); }
+  } catch (e) {
+    console.error(e);
+    await msg.reply(`${NO} Não consegui gerar o resumo curto.`);
+  }
 }
 
 function parseDateBR(s) {
@@ -136,7 +162,8 @@ function parseDateBR(s) {
 async function handleNext(msg, link) {
   try {
     const tasks = await readTasks(link.sheetId);
-    const today = new Date(); const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate()+1);
+    const today = new Date();
+    const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate()+1);
     const trunc = (dt)=> new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
     const due = tasks.filter(t => {
       const dt = parseDateBR(t.dataTermino||t.dataFim||''); if(!dt) return false;
@@ -147,7 +174,10 @@ async function handleNext(msg, link) {
     const title = `${B(`${link.projectName} — Próximos (hoje/amanhã)`)}\n`;
     const lines = due.length ? due.map(t => `• ${t.tarefa} ${I(t.responsavel?`(${t.responsavel})`:'')}`).join('\n') : 'Nenhuma tarefa para hoje/amanhã.';
     await safeReply(msg, title + lines);
-  } catch (e) { console.error(e); await msg.reply(`${NO} Não consegui obter os próximos itens.`); }
+  } catch (e) {
+    console.error(e);
+    await msg.reply(`${NO} Não consegui obter os próximos itens.`);
+  }
 }
 
 async function handleLate(msg, link) {
@@ -157,15 +187,23 @@ async function handleLate(msg, link) {
     const title = `${B(`${link.projectName} — Atrasadas (top 8)`)}\n`;
     const lines = atrasadas.length ? atrasadas.map(t => `• ${t.tarefa} ${I(t.responsavel?`(${t.responsavel})`:'')}`).join('\n') : 'Sem atrasadas. 👌';
     await safeReply(msg, title + lines);
-  } catch (e) { console.error(e); await msg.reply(`${NO} Não consegui listar atrasadas.`); }
+  } catch (e) {
+    console.error(e);
+    await msg.reply(`${NO} Não consegui listar atrasadas.`);
+  }
 }
 
 async function handleRemindNow(msg, link) { await handleSummaryComplete(msg, link); }
 
 async function handleNote(msg, link, noteText) {
   if (!noteText) return msg.reply(`${WARN} Escreva a nota: /note <texto>`);
-  try { await msg.reply(`${OK} Nota registrada: ${noteText}`); }  // plugue no seu appendLog se quiser
-  catch (e) { console.error(e); await msg.reply(`${NO} Não consegui registrar a nota agora.`); }
+  try {
+    await msg.reply(`${OK} Nota registrada: ${noteText}`);
+    // aqui você pode gravar no seu LOG ou Sheets (append) se quiser
+  } catch (e) {
+    console.error(e);
+    await msg.reply(`${NO} Não consegui registrar a nota agora.`);
+  }
 }
 
 async function handleWho(msg, link) {
@@ -179,109 +217,109 @@ async function handleWho(msg, link) {
 
 async function handleHelp(msg, link) { await safeReply(msg, helpCard(link?.projectName)); }
 
-// ------- Wire & Router -------
+// ===== Wire & Router =====
 function wireEvents(c) {
-  c.on('qr', (qr) => { lastQr = qr; currentState='qr'; console.log('[WA] QR gerado'); });
+  c.on('qr', (qr) => { lastQr = qr; currentState='qr'; console.log('[WA] QR gerado. Abra /wa-qr.'); });
   c.on('authenticated', ()=> console.log('[WA] Autenticado'));
-  c.on('auth_failure', (m)=>{ console.error('[WA] auth_failure', m); safeReinit('auth_failure'); });
-  c.on('ready', ()=>{ currentState='ready'; console.log('[WA] Pronto ✅'); });
-  c.on('disconnected', (r)=>{ currentState='disconnected'; console.error('[WA] Desconectado', r); safeReinit('disconnected'); });
+  c.on('auth_failure', (m)=>{ console.error('[WA] Falha de auth:', m); safeReinit('auth_failure'); });
+  c.on('ready', ()=>{ currentState='ready'; console.log('[WA] Cliente pronto ✅'); });
+  c.on('disconnected', (r)=>{ currentState='disconnected'; console.error('[WA] Desconectado:', r); safeReinit('disconnected'); });
+
+  // ===== Mensagens =====
   c.on('message', async (msg) => {
-  try {
-    const chat = await msg.getChat();
-    const isGroup = chat.isGroup;
-    if (!isGroup) return;
+    try {
+      const chat = await msg.getChat();
+      const isGroup = chat.isGroup;
+      if (!isGroup) {
+        // 1:1 → IA geral
+        const reply = await generateReply(msg.body || '', { from: msg.from, pushName: msg._data?.notifyName });
+        return safeReply(msg, reply);
+      }
 
-    const chatId = msg.from;
-    const text = msg.body || '';
-    const isCommand = text.trim().startsWith('/');
+      const chatId = msg.from;
+      const text = msg.body || '';
 
-    // 🔹 [INSERIR AQUI — antes de qualquer if (muteMap.get(chatId))]
-    // 1) Desmutar deve funcionar mesmo em silêncio
-    if (isCommand && /^\/mute\s+off/i.test(text)) {
-      muteMap.delete(chatId);
-      return msg.reply('_voltei a falar 😉_');
-    }
-    if (isCommand && /^\/silencio\s+off/i.test(text)) {
-      muteMap.delete(chatId);
-      return msg.reply('_voltei a falar 😉_');
-    }
+      // normalização única para todos os testes
+      const norm = (text || '')
+        .toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove acentos
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    // 2) Se estiver mutado, sai (exceto os casos acima)
-    if (muteMap.get(chatId)) return;
+      const isCommand = text.trim().startsWith('/');
+      const mentioned = wasBotMentioned(msg);
 
-    // 3) Ativar mute
-    if (isCommand && /^\/mute\s+on/i.test(text)) {
-      muteMap.set(chatId, true);
-      return msg.reply('_ok, fico em silêncio até /mute off_');
-    }
-    if (isCommand && /^\/silencio\s+on/i.test(text)) {
-      muteMap.set(chatId, true);
-      return msg.reply('_ok, fico em silêncio até /mute off_');
-    }
+      // ====== 1) DESMUTAR (funciona mesmo se estiver mutado) ======
+      // aceita: "/mute off", "mute off", "/silencio off", "tira o silencio", "volta a falar", "pode falar"...
+      if (/(^| )\/?mute ?off\b|(^| )silencio ?off\b|(^| )desmut(a|ar)\b|(^| )tira(r)? o? ?silencio\b|(^| )volta(r)? a falar\b|(^| )pode falar\b/.test(norm)) {
+        muteMap.delete(chatId);
+        return msg.reply('_voltei a falar 😉_');
+      }
 
-    // ... [resto do fluxo de comandos: setup, summary, etc.]
+      // ====== 2) Gate de silêncio ======
+      if (muteMap.get(chatId)) return;
 
-      // Upload
-      if (msg.hasMedia && isGroup) {
+      // ====== 3) ATIVAR MUTE ======
+      // aceita: "/mute on", "mute on", "/silencio on", "silencio total", "fica em silencio", "mudo", "shhh"
+      if (/(^| )\/?mute ?on\b|(^| )silencio ?on\b|(^| )silencio total\b|(^| )fica em silencio\b|(^| )mudo\b|(^| )sh+h+\b/.test(norm)) {
+        muteMap.set(chatId, true);
+        return msg.reply('_ok, fico em silêncio até /mute off_');
+      }
+
+      // ===== Upload de mídia para o Drive =====
+      if (msg.hasMedia) {
         const link = getProjectLink(chatId);
         if (!link) return msg.reply(`${WARN} Vincule o projeto: /setup <sheetId|url> | <Nome>`);
         try {
           const res = await saveIncomingMediaToDrive(c, msg, link);
           if (res?.url) return safeReply(msg, `${OK} Arquivo salvo em ${B(link.projectName)}.\n🔗 ${res.url}`);
           return msg.reply(`${NO} Não consegui salvar no Drive.`);
-        } catch(e){ console.error(e); return msg.reply(`${NO} Não consegui salvar no Drive.`); }
-      }
-
-      if (isGroup) {
-        if (muteMap.get(chatId)) return; // silêncio
-
-        const isCommand = text.trim().startsWith('/');
-        const mentioned = wasBotMentioned(msg);
-        if (!isCommand && !mentioned) return;
-
-        // /setup
-        if (isCommand && /^\/setup/i.test(text)) {
-          const parts = text.split('|');
-          const sheetRaw = (parts[0]||'').replace(/\/setup/i,'').trim();
-          const projectName = (parts[1]||'').trim();
-          const sheetId = extractSheetId(sheetRaw);
-          if (!sheetId || !projectName) return msg.reply(`${WARN} Use: /setup <sheetId|url> | <Nome do Projeto>`);
-          setProjectLink(chatId, sheetId, projectName);
-          return safeReply(msg, `${OK} ${B('Projeto vinculado!')}\n• Planilha: ${sheetId}\n• Nome: ${projectName}`);
-        }
-
-        // mute
-        if (isCommand && /^\/mute\s+on/i.test(text)) { muteMap.set(chatId,true); return msg.reply(I('ok, fico em silêncio até /mute off')); }
-        if (isCommand && /^\/mute\s+off/i.test(text)) { muteMap.delete(chatId); return msg.reply(I('voltei a falar 😉')); }
-
-        const link = getProjectLink(chatId);
-        if (!link) return msg.reply(`${WARN} Vincule o projeto: /setup <sheetId|url> | <Nome>`);
-
-        const nlu = parseNLU(text);
-        switch (nlu.intent) {
-          case INTENTS.HELP: return handleHelp(msg, link);
-          case INTENTS.SUMMARY: return handleSummaryComplete(msg, link);
-          case INTENTS.SUMMARY_BRIEF: return handleSummaryBrief(msg, link);
-          case INTENTS.SUMMARY_FULL: return handleSummaryComplete(msg, link);
-          case INTENTS.NEXT: return handleNext(msg, link);
-          case INTENTS.LATE: return handleLate(msg, link);
-          case INTENTS.REMIND_NOW: return handleRemindNow(msg, link);
-          case INTENTS.NOTE: return handleNote(msg, link, nlu.note);
-          case INTENTS.WHO: return handleWho(msg, link);
-          case INTENTS.MUTE_ON: muteMap.set(chatId,true); return msg.reply(I('ok, fico em silêncio até /mute off'));
-          case INTENTS.MUTE_OFF: muteMap.delete(chatId); return msg.reply(I('voltei a falar 😉'));
-          default: return handleHelp(msg, link);
+        } catch (e) {
+          console.error(e);
+          return msg.reply(`${NO} Não consegui salvar no Drive.`);
         }
       }
 
-      // 1:1 → IA atual
-      const reply = await generateReply(text, { from: msg.from, pushName: msg._data?.notifyName });
-      await safeReply(msg, reply);
+      // ===== Roteamento por comando/menção =====
+      if (!isCommand && !mentioned) return;
 
+      // /setup (sempre disponível)
+      if (isCommand && /^\/setup/i.test(text)) {
+        const parts = text.split('|');
+        const sheetRaw = (parts[0] || '').replace(/\/setup/i, '').trim();
+        const projectName = (parts[1] || '').trim();
+        const sheetId = extractSheetId(sheetRaw);
+        if (!sheetId || !projectName) {
+          return msg.reply(`${WARN} Use: /setup <sheetId|url> | <Nome do Projeto>`);
+        }
+        setProjectLink(chatId, sheetId, projectName);
+        return safeReply(msg, `${OK} ${B('Projeto vinculado!')}\n• Planilha: ${sheetId}\n• Nome: ${projectName}`);
+      }
+
+      // precisa estar vinculado para o restante
+      const link = getProjectLink(chatId);
+      if (!link) return msg.reply(`${WARN} Vincule o projeto: /setup <sheetId|url> | <Nome>`);
+
+      // NLU leve (comandos naturais)
+      const nlu = parseNLU(text);
+
+      switch (nlu.intent) {
+        case INTENTS.HELP:           return handleHelp(msg, link);
+        case INTENTS.SUMMARY:        return handleSummaryComplete(msg, link);
+        case INTENTS.SUMMARY_BRIEF:  return handleSummaryBrief(msg, link);
+        case INTENTS.SUMMARY_FULL:   return handleSummaryComplete(msg, link);
+        case INTENTS.NEXT:           return handleNext(msg, link);
+        case INTENTS.LATE:           return handleLate(msg, link);
+        case INTENTS.REMIND_NOW:     return handleRemindNow(msg, link);
+        case INTENTS.NOTE:           return handleNote(msg, link, nlu.note);
+        case INTENTS.WHO:            return handleWho(msg, link);
+        case INTENTS.MUTE_ON:        muteMap.set(chatId, true); return msg.reply(I('ok, fico em silêncio até /mute off'));
+        case INTENTS.MUTE_OFF:       muteMap.delete(chatId);   return msg.reply(I('voltei a falar 😉'));
+        default:                     return handleHelp(msg, link);
+      }
     } catch (err) {
-      console.error('[WA] erro msg:', err);
-      try { await msg.reply('Dei uma engasgada técnica aqui. Pode reenviar?'); } catch(_) {}
+      console.error('[WA] Erro ao processar mensagem:', err);
+      try { await msg.reply('Dei uma engasgada técnica aqui. Pode reenviar?'); } catch (_) {}
     }
   });
 }
@@ -290,29 +328,48 @@ function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
 
+  // Health endpoints
   if (app && app.get) {
-    app.get('/wa-status', async (_req,res)=> {
+    app.get('/wa-status', async (_req, res) => {
       let state = currentState;
-      try { const s = await client.getState().catch(()=>null); if (s) state = s; } catch(_){}
+      try {
+        const s = await client.getState().catch(() => null);
+        if (s) state = s;
+      } catch (_) {}
       res.json({ status: state });
     });
-    app.get('/wa-qr', async (_req,res)=>{
+
+    app.get('/wa-qr', async (_req, res) => {
       try {
         const qr = getLastQr();
-        if (!qr) return res.status(503).send('QR ainda não gerado. Aguarde e recarregue.');
-        const png = await QRCode.toBuffer(qr, { type:'png', margin:1, scale:6 });
+        if (!qr) {
+          return res.status(503).send('QR ainda não gerado. Aguarde alguns segundos e atualize a página.');
+        }
+        const png = await QRCode.toBuffer(qr, { type: 'png', margin: 1, scale: 6 });
         res.type('image/png').send(png);
-      } catch(e){ console.error(e); res.status(500).send('Erro ao gerar QR'); }
+      } catch (e) {
+        console.error('[WA] Erro ao gerar QR:', e);
+        res.status(500).send('Erro ao gerar QR');
+      }
     });
   }
 
   client.initialize();
-  setInterval(async ()=>{
+
+  // Watchdog simples
+  setInterval(async () => {
     try {
-      const s = await client.getState().catch(()=>null);
-      if (!s || ['CONFLICT','UNPAIRED','UNLAUNCHED'].includes(s)) safeReinit(`watchdog:${s||'null'}`);
-      else if (currentState!=='ready' && s==='CONNECTED') currentState = 'ready';
-    } catch(e){ safeReinit('watchdog-error'); }
+      const s = await client.getState().catch(() => null);
+      if (!s || s === 'CONFLICT' || s === 'UNPAIRED' || s === 'UNLAUNCHED') {
+        console.log(`[WA] Watchdog: estado crítico (${s || 'null'}) → reinit`);
+        safeReinit(`watchdog:${s || 'null'}`);
+      } else if (currentState !== 'ready' && s === 'CONNECTED') {
+        currentState = 'ready';
+      }
+    } catch (err) {
+      console.error('[WA] Watchdog erro:', err);
+      safeReinit('watchdog-error');
+    }
   }, WATCHDOG_INTERVAL_MS);
 }
 
