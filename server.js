@@ -3,8 +3,21 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const QRCode = require('qrcode');
 const { initWhatsApp, getLastQr } = require('./whatsapp');
+const app = express();
+const express = require('express');
+const { initWhatsApp, sendText, sendAudio, getClient } = require('./whatsapp');
+const { startScheduler } = require('./scheduler');
 
 const app = express();
+app.use(express.json());
+
+initWhatsApp(app);
+
+// inicia o scheduler com a “API” do WhatsApp (as duas funções)
+startScheduler({ sendText, sendAudio, getClient });
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
