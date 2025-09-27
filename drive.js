@@ -1,121 +1,72 @@
-// drive.js
-// Uploads no Google Drive usando OAuth (conta do usuário).
-// Requer envs: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN
-// Opcional: GOOGLE_OAUTH_REDIRECT_URI (default: http://localhost)
+// drive.js (ADICIONE estes helpers ao seu arquivo existente)
 
 const { google } = require('googleapis');
-const { Readable } = require('stream');
 
-function getOAuthClient() {
-  const {
-    GOOGLE_OAUTH_CLIENT_ID: clientId,
-    GOOGLE_OAUTH_CLIENT_SECRET: clientSecret,
-    GOOGLE_OAUTH_REFRESH_TOKEN: refreshToken,
-    GOOGLE_OAUTH_REDIRECT_URI: redirectUri = 'http://localhost',
-  } = process.env;
-
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error('Faltam envs do OAuth (CLIENT_ID/SECRET/REFRESH_TOKEN).');
-  }
-
-  const oAuth2 = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-  oAuth2.setCredentials({ refresh_token: refreshToken });
-  return oAuth2;
+function getDrive() {
+  const raw = process.env.GOOGLE_SA_JSON;
+  if (!raw) throw new Error('GOOGLE_SA_JSON ausente.');
+  const sa = JSON.parse(raw.replace(/\n/g, '\\n'));
+  const jwt = new google.auth.JWT(
+    sa.client_email, null, sa.private_key,
+    ['https://www.googleapis.com/auth/drive']
+  );
+  return google.drive({ version: 'v3', auth: jwt });
 }
 
-function driveClient() {
-  return google.drive({ version: 'v3', auth: getOAuthClient() });
-}
+async function ensureFolder(name, parentId) {
+  const drive = getDrive();
+  const q = `'${parentId}' in parents and name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const { data } = await drive.files.list({ q, fields: 'files(id,name)' });
+  if (data.files?.length) return data.files[0].id;
 
-async function findFolderByName(name, parentId) {
-  const drive = driveClient();
-  const qParts = [
-    `mimeType='application/vnd.google-apps.folder'`,
-    `name='${name.replace(/'/g, "\\'")}'`,
-    'trashed=false',
-  ];
-  if (parentId) qParts.push(`'${parentId}' in parents`);
-  const q = qParts.join(' and ');
-
-  const { data } = await drive.files.list({
-    q,
-    fields: 'files(id, name)',
-    pageSize: 1,
-    supportsAllDrives: false,
+  const res = await drive.files.create({
+    requestBody: {
+      name,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId],
+    },
+    fields: 'id,name',
   });
-  return (data.files && data.files[0]) || null;
+  return res.data.id;
 }
 
-async function createFolder(name, parentId) {
-  const drive = driveClient();
-  const fileMetadata = {
-    name,
-    mimeType: 'application/vnd.google-apps.folder',
-    parents: parentId ? [parentId] : undefined,
-  };
-  const { data } = await drive.files.create({
-    requestBody: fileMetadata,
-    fields: 'id, name',
-    supportsAllDrives: false,
-  });
-  return data;
-}
+/**
+ * Sobe um Buffer dentro da pasta do projeto, criando subpasta se necessário.
+ * @param {object} link { sheetId, projectName, driveProjectFolderId? }
+ * @param {string} subfolder ex: 'Resumos/Diario'
+ * @param {string} filename ex: '2025-09-26-Diario.ogg'
+ * @param {string} mime 'audio/ogg' | 'text/markdown'
+ * @param {Buffer} buf
+ * @returns url público (se compartilhado) ou webViewLink
+ */
+async function uploadBufferToProject(link, subfolder, filename, mime, buf) {
+  // Você já deve ter uma forma de obter/guardar a pasta raiz do projeto.
+  // Caso ainda não tenha, reaproveite o local onde salva anexos do grupo.
+  // Aqui assumo que há env DRIVE_ROOT_FOLDER_ID (pasta “Documentos do Projeto”).
+  const ROOT = process.env.DRIVE_ROOT_FOLDER_ID;
+  if (!ROOT) throw new Error('DRIVE_ROOT_FOLDER_ID ausente.');
 
-async function ensureFolderPath(pathArr) {
-  // Garante que exista "pathArr[0]/pathArr[1]/..."
-  let parentId = null;
-  for (const segment of pathArr) {
-    let folder = await findFolderByName(segment, parentId);
-    if (!folder) folder = await createFolder(segment, parentId);
-    parentId = folder.id;
+  const drive = getDrive();
+
+  const projectFolder = await ensureFolder(link.projectName, ROOT);
+
+  // subpastas encadeadas (ex.: "Resumos/Semanal")
+  let parentId = projectFolder;
+  if (subfolder) {
+    const parts = subfolder.split('/').filter(Boolean);
+    for (const p of parts) parentId = await ensureFolder(p, parentId);
   }
-  return parentId; // id da última pasta
-}
 
-async function ensureProjectTree(projectName) {
-  // Raiz -> "Documentos de Projeto" -> "{projectName}" -> subpastas
-  const root = await ensureFolderPath(['Documentos de Projeto', projectName]);
-  const subfolders = ['Insumos', 'Saídas', 'Anexos'];
-  for (const s of subfolders) {
-    await ensureFolderPath(['Documentos de Projeto', projectName, s]);
-  }
-  return { projectRootId: root };
-}
-
-// Helper: converte Buffer para stream aceitável pelo Drive API
-function bufferToStream(buffer) {
-  return Readable.from(buffer);
-}
-
-async function uploadBufferToProject(buffer, filename, mimeType, projectName, subfolder = 'Anexos') {
-  if (!projectName) throw new Error('projectName ausente para upload.');
-
-  const { projectRootId } = await ensureProjectTree(projectName);
-  const targetFolderId = await ensureFolderPath(['Documentos de Projeto', projectName, subfolder]);
-
-  const drive = driveClient();
-  const media = {
-    mimeType: mimeType || 'application/octet-stream',
-    body: bufferToStream(buffer),
-  };
-
-  const fileMetadata = {
-    name: filename || 'arquivo',
-    parents: [targetFolderId],
-  };
-
-  const { data } = await drive.files.create({
-    requestBody: fileMetadata,
+  const media = { mimeType: mime, body: Buffer.isBuffer(buf) ? buf : Buffer.from(buf) };
+  const file = await drive.files.create({
+    requestBody: { name: filename, parents: [parentId] },
     media,
     fields: 'id, name, webViewLink, webContentLink',
-    supportsAllDrives: false,
   });
-
-  // Por padrão, fica restrito ao seu Drive (sem compartilhar publicamente).
-  return data; // { id, name, webViewLink, webContentLink }
+  return file.data.webViewLink || file.data.webContentLink;
 }
 
 module.exports = {
-  ensureProjectTree,
+  // ... exporte aqui também as funções antigas que você já tinha
   uploadBufferToProject,
 };
