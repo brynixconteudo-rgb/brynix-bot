@@ -1,78 +1,51 @@
-// tts.js
-// Síntese de voz usando Google Cloud Text-to-Speech (pt-BR).
-// Usa credenciais de Service Account do env GOOGLE_SA_JSON.
-// VARS (Render):
-//   - GOOGLE_SA_JSON            -> JSON da service account (string inteira)
-//   - TTS_VOICE                 -> nome da voz (ex.: "pt-BR-Neural2-A")
-//   - TTS_SPEAKING_RATE         -> opcional (ex.: "1.0")
-//   - TTS_PITCH                 -> opcional (ex.: "0.0")
+// tts.js (OpenAI)
+// Gera áudio (MP3) a partir de texto usando a API de TTS da OpenAI.
+// Requisitos:
+//   - ENV OPENAI_API_KEY
+//   - (opcional) ENV TTS_MODEL      -> default: gpt-4o-mini-tts
+//   - (opcional) ENV TTS_VOICE      -> default: alloy
+//   - (opcional) ENV TTS_FORMAT     -> default: mp3
+//
+// Uso: const { synthesize } = require('./tts'); const audio = await synthesize('texto', { voice: 'alloy' });
+// Retorno: { mime: 'audio/mpeg', buffer: <Buffer> }  ou  null se falhar.
 
-const tts = require('@google-cloud/text-to-speech');
+const OpenAI = require('openai');
 
-function readSA() {
-  const raw = process.env.GOOGLE_SA_JSON || '';
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // Se colaram com quebras, tenta normalizar
-    try {
-      return JSON.parse(raw.replace(/\n/g, '\\n'));
-    } catch {
-      return null;
-    }
-  }
-}
+const apiKey    = process.env.OPENAI_API_KEY || '';
+const TTS_MODEL = process.env.TTS_MODEL || 'gpt-4o-mini-tts';
+const TTS_VOICE = process.env.TTS_VOICE || 'alloy';
+const TTS_FORMAT= (process.env.TTS_FORMAT || 'mp3').toLowerCase();
 
-const sa = readSA();
-let client = null;
-if (sa) {
-  client = new tts.TextToSpeechClient({
-    credentials: {
-      client_email: sa.client_email,
-      private_key: sa.private_key,
-    },
-    projectId: sa.project_id,
-  });
-}
+let openai = null;
+if (apiKey) openai = new OpenAI({ apiKey });
 
-// text -> { mime, buffer } | null
+/** Converte texto em áudio (Buffer). */
 async function synthesize(text, opts = {}) {
   try {
-    if (!client) {
-      console.warn('[TTS] Sem GOOGLE_SA_JSON; TTS desativado.');
+    if (!openai) {
+      console.warn('[TTS] OPENAI_API_KEY ausente; TTS desativado.');
       return null;
     }
+    const voice  = (opts.voice || TTS_VOICE || 'alloy').trim();
+    const format = ['mp3','wav','flac','ogg'].includes(TTS_FORMAT) ? TTS_FORMAT : 'mp3';
 
-    const voiceName = (opts.voice || process.env.TTS_VOICE || 'pt-BR-Neural2-A').trim();
-    // Heurística simples para a languageCode (todas pt-BR-* usam "pt-BR")
-    const languageCode = voiceName.startsWith('pt-') ? 'pt-BR' : 'pt-BR';
+    const resp = await openai.audio.speech.create({
+      model: TTS_MODEL,
+      voice,
+      input: String(text || ''),
+      format, // mp3|wav|flac|ogg
+    });
 
-    const speakingRate = Number(process.env.TTS_SPEAKING_RATE || opts.speakingRate || '1.0');
-    const pitch = Number(process.env.TTS_PITCH || opts.pitch || '0.0');
+    // SDK retorna um web stream / arrayBuffer
+    const arrayBuffer = await resp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
-    const request = {
-      input: { text: String(text || '') },
-      voice: {
-        languageCode,
-        name: voiceName, // ex.: "pt-BR-Neural2-A"
-        ssmlGender: 'FEMALE', // ajuda a escolher timbre quando a voz não for explicitada
-      },
-      audioConfig: {
-        audioEncoding: 'MP3',
-        speakingRate,
-        pitch,
-      },
-    };
+    const mime =
+      format === 'wav'  ? 'audio/wav'  :
+      format === 'flac' ? 'audio/flac' :
+      format === 'ogg'  ? 'audio/ogg'  : 'audio/mpeg';
 
-    const [response] = await client.synthesizeSpeech(request);
-    const audioContent = response.audioContent;
-    if (!audioContent) return null;
-
-    return {
-      mime: 'audio/mpeg',
-      buffer: Buffer.from(audioContent, 'base64'),
-    };
+    return { mime, buffer };
   } catch (e) {
     console.error('[TTS] synthesize erro:', e?.message || e);
     return null;
