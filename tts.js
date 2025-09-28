@@ -1,71 +1,78 @@
-// tts.js (Google Cloud Text-to-Speech)
-// ENV necessários:
-//  - GOOGLE_TTS_SA_JSON   (conteúdo JSON da Service Account)  *ou*
-//  - GOOGLE_APPLICATION_CREDENTIALS (caminho para o JSON no disco)
-// Opcionais:
-//  - TTS_VOICE           (default: pt-BR-Neural2-A)
-//  - TTS_SPEAKING_RATE   (default: 1.0)
+// tts.js
+// Síntese de voz usando Google Cloud Text-to-Speech (pt-BR).
+// Usa credenciais de Service Account do env GOOGLE_SA_JSON.
+// VARS (Render):
+//   - GOOGLE_SA_JSON            -> JSON da service account (string inteira)
+//   - TTS_VOICE                 -> nome da voz (ex.: "pt-BR-Neural2-A")
+//   - TTS_SPEAKING_RATE         -> opcional (ex.: "1.0")
+//   - TTS_PITCH                 -> opcional (ex.: "0.0")
 
-const textToSpeech = require('@google-cloud/text-to-speech');
+const tts = require('@google-cloud/text-to-speech');
 
-function buildGCPTTSClient() {
-  // 1) Preferimos GOOGLE_TTS_SA_JSON (conteúdo em texto)
-  const saJson = process.env.GOOGLE_TTS_SA_JSON || '';
-  let client;
-  if (saJson) {
+function readSA() {
+  const raw = process.env.GOOGLE_SA_JSON || '';
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // Se colaram com quebras, tenta normalizar
     try {
-      const creds = JSON.parse(saJson);
-      client = new textToSpeech.TextToSpeechClient({ credentials: creds });
-      return client;
-    } catch (e) {
-      console.error('[TTS] Falha ao parsear GOOGLE_TTS_SA_JSON:', e?.message || e);
+      return JSON.parse(raw.replace(/\n/g, '\\n'));
+    } catch {
+      return null;
     }
   }
-
-  // 2) Alternativa: GOOGLE_APPLICATION_CREDENTIALS (caminho no filesystem)
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    try {
-      client = new textToSpeech.TextToSpeechClient();
-      return client;
-    } catch (e) {
-      console.error('[TTS] Erro ao criar cliente GCP TTS (por arquivo):', e?.message || e);
-    }
-  }
-
-  console.warn('[TTS] Sem credenciais do Google TTS; sintetizador desativado.');
-  return null;
 }
 
-const client = buildGCPTTSClient();
+const sa = readSA();
+let client = null;
+if (sa) {
+  client = new tts.TextToSpeechClient({
+    credentials: {
+      client_email: sa.client_email,
+      private_key: sa.private_key,
+    },
+    projectId: sa.project_id,
+  });
+}
 
+// text -> { mime, buffer } | null
 async function synthesize(text, opts = {}) {
   try {
-    if (!client) return null;
+    if (!client) {
+      console.warn('[TTS] Sem GOOGLE_SA_JSON; TTS desativado.');
+      return null;
+    }
 
-    const voiceName = process.env.TTS_VOICE || opts.voice || 'pt-BR-Neural2-A';
-    const speakingRate = parseFloat(process.env.TTS_SPEAKING_RATE || '1.0');
+    const voiceName = (opts.voice || process.env.TTS_VOICE || 'pt-BR-Neural2-A').trim();
+    // Heurística simples para a languageCode (todas pt-BR-* usam "pt-BR")
+    const languageCode = voiceName.startsWith('pt-') ? 'pt-BR' : 'pt-BR';
+
+    const speakingRate = Number(process.env.TTS_SPEAKING_RATE || opts.speakingRate || '1.0');
+    const pitch = Number(process.env.TTS_PITCH || opts.pitch || '0.0');
 
     const request = {
-      input: { text: text || '' },
-      // Voz pt-BR natural; se quiser outra, ajuste voiceName
+      input: { text: String(text || '') },
       voice: {
-        name: voiceName,           // ex: 'pt-BR-Neural2-A'
-        languageCode: 'pt-BR',     // força idioma
-        ssmlGender: 'FEMALE',      // ajuda a guiar o timbre feminino
+        languageCode,
+        name: voiceName, // ex.: "pt-BR-Neural2-A"
+        ssmlGender: 'FEMALE', // ajuda a escolher timbre quando a voz não for explicitada
       },
       audioConfig: {
         audioEncoding: 'MP3',
-        speakingRate: isNaN(speakingRate) ? 1.0 : speakingRate, // 0.25–4.0
+        speakingRate,
+        pitch,
       },
     };
 
     const [response] = await client.synthesizeSpeech(request);
-    if (!response || !response.audioContent) {
-      console.warn('[TTS] Resposta sem audioContent.');
-      return null;
-    }
+    const audioContent = response.audioContent;
+    if (!audioContent) return null;
 
-    return { mime: 'audio/mpeg', buffer: Buffer.from(response.audioContent, 'base64') };
+    return {
+      mime: 'audio/mpeg',
+      buffer: Buffer.from(audioContent, 'base64'),
+    };
   } catch (e) {
     console.error('[TTS] synthesize erro:', e?.message || e);
     return null;
