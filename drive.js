@@ -1,172 +1,187 @@
 // drive.js
-// Upload de anexos para Google Drive usando OAuth de usuário (não Service Account).
-// ENV obrigatórias:
-//   DRIVE_CLIENT_ID
-//   DRIVE_CLIENT_SECRET
-//   DRIVE_REFRESH_TOKEN
-//   DRIVE_ROOT_FOLDER_ID   (pasta raiz onde ficarão os projetos)
+// Upload de anexos do WhatsApp para o Google Drive usando OAuth (client ID/secret + refresh token).
+// Suporta os dois conjuntos de nomes de variáveis (os seus e os antigos):
 //
-// Saída principal exportada: saveIncomingMediaToDrive(client, msg, link)
-//   - link = { sheetId, projectName }
-
+// Necessários (qualquer um dos pares):
+//  - GOOGLE_OAUTH_CLIENT_ID           || DRIVE_CLIENT_ID
+//  - GOOGLE_OAUTH_CLIENT_SECRET       || DRIVE_CLIENT_SECRET
+//  - GOOGLE_OAUTH_REFRESH_TOKEN       || DRIVE_REFRESH_TOKEN
+//  - GOOGLE_DRIVE_ROOT_FOLDER_ID      || DRIVE_ROOT_FOLDER_ID
+// Opcionais:
+//  - GOOGLE_OAUTH_REDIRECT_URI   (pode ficar em branco)
+//
 const { google } = require('googleapis');
-const path = require('path');
-const crypto = require('crypto');
 
-const REQUIRED_ENVS = [
-  'DRIVE_CLIENT_ID',
-  'DRIVE_CLIENT_SECRET',
-  'DRIVE_REFRESH_TOKEN',
-  'DRIVE_ROOT_FOLDER_ID',
-];
+const OAUTH_CLIENT_ID =
+  process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.DRIVE_CLIENT_ID || '';
+const OAUTH_CLIENT_SECRET =
+  process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.DRIVE_CLIENT_SECRET || '';
+const OAUTH_REFRESH_TOKEN =
+  process.env.GOOGLE_OAUTH_REFRESH_TOKEN || process.env.DRIVE_REFRESH_TOKEN || '';
+const ROOT_FOLDER_ID =
+  process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || process.env.DRIVE_ROOT_FOLDER_ID || '';
+const OAUTH_REDIRECT_URI =
+  process.env.GOOGLE_OAUTH_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob';
 
-function missingEnv() {
-  const missing = REQUIRED_ENVS.filter((k) => !process.env[k]);
-  return missing.length ? missing : null;
+function haveOAuth() {
+  return (
+    OAUTH_CLIENT_ID &&
+    OAUTH_CLIENT_SECRET &&
+    OAUTH_REFRESH_TOKEN &&
+    ROOT_FOLDER_ID
+  );
 }
 
-function buildOAuth() {
-  const missing = missingEnv();
-  if (missing) {
-    console.warn('[DRIVE] Variáveis ausentes:', missing.join(', '));
-    return null;
-  }
+function buildOAuth2Client() {
   const oAuth2Client = new google.auth.OAuth2(
-    process.env.DRIVE_CLIENT_ID,
-    process.env.DRIVE_CLIENT_SECRET,
-    'urn:ietf:wg:oauth:2.0:oob'
+    OAUTH_CLIENT_ID,
+    OAUTH_CLIENT_SECRET,
+    OAUTH_REDIRECT_URI
   );
-  oAuth2Client.setCredentials({ refresh_token: process.env.DRIVE_REFRESH_TOKEN });
+  oAuth2Client.setCredentials({ refresh_token: OAUTH_REFRESH_TOKEN });
   return oAuth2Client;
 }
 
 function driveClient() {
-  const auth = buildOAuth();
-  if (!auth) return null;
+  const auth = buildOAuth2Client();
   return google.drive({ version: 'v3', auth });
 }
 
-async function ensureFolder(drive, name, parentId) {
-  // procura pasta com esse nome sob o parent
+async function findFolder(drive, name, parentId) {
   const q = [
-    `name = '${name.replace(/'/g, "\\'")}'`,
-    `mimeType = 'application/vnd.google-apps.folder'`,
-    `'${parentId}' in parents`,
-    'trashed = false',
-  ].join(' and ');
+    `mimeType='application/vnd.google-apps.folder'`,
+    `name='${name.replace(/'/g, "\\'")}'`,
+    `trashed=false`
+  ];
+  if (parentId) q.push(`'${parentId}' in parents`);
+  const res = await drive.files.list({
+    q: q.join(' and '),
+    fields: 'files(id,name,parents)',
+    includeItemsFromAllDrives: true,
+    supportsAllDrives: true
+  });
+  return (res.data.files && res.data.files[0]) || null;
+}
 
-  const list = await drive.files.list({ q, fields: 'files(id, name)' });
-  if (list.data.files && list.data.files.length) return list.data.files[0].id;
+async function ensureFolder(drive, name, parentId) {
+  const existing = await findFolder(drive, name, parentId);
+  if (existing) return existing.id;
 
-  // cria
-  const res = await drive.files.create({
+  const file = await drive.files.create({
     requestBody: {
       name,
       mimeType: 'application/vnd.google-apps.folder',
-      parents: [parentId],
+      parents: parentId ? [parentId] : undefined
     },
-    fields: 'id, name',
+    fields: 'id',
+    supportsAllDrives: true
   });
-  return res.data.id;
+  return file.data.id;
 }
 
-async function createOrGetProjectFolders(drive, projectName) {
-  const rootId = process.env.DRIVE_ROOT_FOLDER_ID;
-  const projectId = await ensureFolder(drive, projectName, rootId);
-  const docsId = await ensureFolder(drive, 'Documentos de Projeto', projectId);
-  return { projectId, docsId };
-}
-
-function guessExt(mime) {
-  if (!mime) return '';
+function extFromMime(mime) {
+  if (!mime) return 'bin';
   const map = {
-    'image/jpeg': '.jpg',
-    'image/png': '.png',
-    'image/webp': '.webp',
-    'image/gif': '.gif',
-    'application/pdf': '.pdf',
-    'audio/mpeg': '.mp3',
-    'audio/ogg': '.ogg',
-    'audio/webm': '.webm',
-    'video/mp4': '.mp4',
-    'application/zip': '.zip',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'application/pdf': 'pdf',
+    'audio/mpeg': 'mp3',
+    'audio/ogg': 'ogg',
+    'video/mp4': 'mp4',
+    'text/plain': 'txt'
   };
-  return map[mime] || '';
-}
-
-async function uploadBuffer(drive, buffer, { filename, mimeType, parentId }) {
-  const res = await drive.files.create({
-    requestBody: {
-      name: filename,
-      mimeType,
-      parents: [parentId],
-    },
-    media: {
-      mimeType,
-      body: Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer),
-    },
-    fields: 'id, name, webViewLink',
-  });
-
-  const fileId = res.data.id;
-
-  // garante que o link de visualização funcione para membros da organização ou link-sharing conforme necessidade
-  // Aqui abrimos como "anyoneWithLink = reader". Ajuste se necessário.
-  try {
-    await drive.permissions.create({
-      fileId,
-      requestBody: { role: 'reader', type: 'anyone' },
-    });
-  } catch (e) {
-    console.warn('[DRIVE] Falha ao abrir permissão pública (ok em ambientes restritos):', e?.message || e);
-  }
-
-  const view = `https://drive.google.com/file/d/${fileId}/view?usp=drivesdk`;
-  return { id: fileId, url: view, name: res.data.name };
+  return map[mime] || 'bin';
 }
 
 /**
- * Salva a mídia recebida no WhatsApp no Drive, sob:
- *   DRIVE_ROOT_FOLDER_ID / <Nome do Projeto> / Documentos de Projeto
+ * Salva mídia recebida no grupo para a pasta do projeto no Drive.
+ * Estrutura:
+ *  ROOT_FOLDER /
+ *    <ProjectName> /
+ *      Documentos de Projeto /
+ *        <arquivo>
+ *
+ * @param {Client} waClient
+ * @param {Message} msg
+ * @param {{sheetId: string, projectName: string}} link
+ * @returns {Promise<{id: string, url?: string} | null>}
  */
-async function saveIncomingMediaToDrive(_client, msg, link) {
+async function saveIncomingMediaToDrive(waClient, msg, link) {
   try {
-    const drive = driveClient();
-    if (!drive) {
+    if (!haveOAuth()) {
+      console.warn(
+        '[DRIVE] Variáveis ausentes: ' +
+          [
+            OAUTH_CLIENT_ID ? '' : 'GOOGLE_OAUTH_CLIENT_ID/DRIVE_CLIENT_ID',
+            OAUTH_CLIENT_SECRET ? '' : 'GOOGLE_OAUTH_CLIENT_SECRET/DRIVE_CLIENT_SECRET',
+            OAUTH_REFRESH_TOKEN ? '' : 'GOOGLE_OAUTH_REFRESH_TOKEN/DRIVE_REFRESH_TOKEN',
+            ROOT_FOLDER_ID ? '' : 'GOOGLE_DRIVE_ROOT_FOLDER_ID/DRIVE_ROOT_FOLDER_ID'
+          ]
+            .filter(Boolean)
+            .join(', ')
+      );
       console.warn('[DRIVE] Sem configuração de OAuth; upload ignorado.');
-      return { url: null };
-    }
-    if (!link?.projectName) {
-      console.warn('[DRIVE] link.projectName ausente.');
-      return { url: null };
+      return null;
     }
 
-    const media = await msg.downloadMedia(); // { mimetype, data(base64) }
+    const media = await msg.downloadMedia();
     if (!media || !media.data) {
-      console.warn('[DRIVE] Sem media.data base64.');
-      return { url: null };
+      console.warn('[DRIVE] Mensagem sem mídia baixável.');
+      return null;
     }
 
-    const bytes = Buffer.from(media.data, 'base64');
-    const ext = guessExt(media.mimetype) || '';
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const rand = crypto.randomBytes(3).toString('hex');
-    const filename = `wa_${stamp}_${rand}${ext}`;
+    const drive = driveClient();
 
-    const { docsId } = await createOrGetProjectFolders(drive, link.projectName);
-    const up = await uploadBuffer(drive, bytes, {
-      filename,
-      mimeType: media.mimetype || 'application/octet-stream',
-      parentId: docsId,
+    // Pastas do projeto
+    const projectFolderId = await ensureFolder(
+      drive,
+      (link.projectName || 'Projeto').trim(),
+      ROOT_FOLDER_ID
+    );
+    const docsFolderId = await ensureFolder(
+      drive,
+      'Documentos de Projeto',
+      projectFolderId
+    );
+
+    // Nome do arquivo
+    const mime = media.mimetype || 'application/octet-stream';
+    const ext = extFromMime(mime);
+    const when = new Date();
+    const baseName =
+      (msg._data?.filename ||
+        (link.projectName || 'arquivo')
+          .normalize('NFD')
+          .replace(/[^\w\s-]/g, '')
+          .trim()
+          .replace(/\s+/g, '_')) + `_${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')}-${String(when.getHours()).padStart(2, '0')}${String(when.getMinutes()).padStart(2, '0')}`;
+    const fileName = `${baseName}.${ext}`;
+
+    // Upload
+    const res = await drive.files.create({
+      requestBody: {
+        name: fileName,
+        parents: [docsFolderId]
+      },
+      media: {
+        mimeType: mime,
+        body: Buffer.from(media.data, 'base64')
+      },
+      fields: 'id, webViewLink, webContentLink',
+      supportsAllDrives: true
     });
 
-    return { url: up.url, id: up.id, name: up.name };
+    const fileId = res.data.id;
+    const url = res.data.webViewLink || res.data.webContentLink || `https://drive.google.com/file/d/${fileId}/view`;
+
+    return { id: fileId, url };
   } catch (e) {
-    console.error('[DRIVE] saveIncomingMediaToDrive erro:', e?.message || e);
-    return { url: null };
+    console.error('[DRIVE] erro upload:', e?.message || e);
+    return null;
   }
 }
 
 module.exports = {
-  saveIncomingMediaToDrive,
+  saveIncomingMediaToDrive
 };
