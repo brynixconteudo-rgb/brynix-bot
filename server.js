@@ -1,31 +1,38 @@
 // server.js
-// Bootstrap do serviço HTTP + WhatsApp + heartbeat do scheduler.
+// Bootstrap do HTTP + WhatsApp + heartbeat do scheduler (logs).
 
 const express = require('express');
-const { initWhatsApp } = require('./whatsapp'); // << desestruturado!
+const wa = require('./whatsapp'); // importa o módulo inteiro
 
 const PORT = process.env.PORT || 10000;
-const TICK_SECONDS = parseInt(process.env.SCHED_TICK || '60', 10); // intervalo do heartbeat (s)
+const TICK_SECONDS = parseInt(process.env.SCHED_TICK || '60', 10);
 
 const app = express();
 
-// Endpoints simples (úteis para Render/healthcheck)
+// health / info
 app.get('/', (_req, res) => res.send('OK'));
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-// Inicializa WhatsApp e expõe /wa-status e /wa-qr via initWhatsApp(app)
-initWhatsApp(app);
+// --- valida exportação do whatsapp.js ---
+if (!wa || typeof wa.initWhatsApp !== 'function') {
+  const keys = wa ? Object.keys(wa) : [];
+  console.error('[BOOT] Export inválido de "./whatsapp". Esperava função initWhatsApp.');
+  console.error('[BOOT] Chaves exportadas pelo módulo:', keys);
+  console.error('[BOOT] Verifique se no final do arquivo whatsapp.js existe:');
+  console.error("        module.exports = { initWhatsApp, getLastQr };");
+  process.exit(1);
+}
 
-// Sobe o HTTP
+// inicializa o WhatsApp e registra /wa-status e /wa-qr
+wa.initWhatsApp(app);
+
+// sobe http
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
 
-// Heartbeat do “scheduler” (apenas batimento/gancho para evolução futura)
-// A lógica de texto/TTS já está disponível pelos comandos ocultos:
-//   /__test daily   | /__test weekly   | /__test tts <texto>
+// heartbeat simples (apenas logging)
 console.log(`[scheduler] iniciado (tick=${TICK_SECONDS}s)`);
 setInterval(() => {
-  // Aqui você pode invocar uma rotina real quando quiser, por ex.:
-  // runScheduledJobs().catch(console.error);
+  // gancho para rotinas futuras (intencionalmente vazio por ora)
 }, TICK_SECONDS * 1000);
