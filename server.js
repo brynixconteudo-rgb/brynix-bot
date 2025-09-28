@@ -1,27 +1,31 @@
-// server.js — versão consolidada (uma única inicialização)
+// server.js
+// Bootstrap do serviço HTTP + WhatsApp + heartbeat do scheduler.
 
-// 1) deps
 const express = require('express');
+const { initWhatsApp } = require('./whatsapp'); // << desestruturado!
 
-// 2) módulos do bot
-const { initWhatsApp, sendText, sendAudio, getClient } = require('./whatsapp');
-const { startScheduler } = require('./scheduler');
+const PORT = process.env.PORT || 10000;
+const TICK_SECONDS = parseInt(process.env.SCHED_TICK || '60', 10); // intervalo do heartbeat (s)
 
-// 3) app http
 const app = express();
-app.use(express.json());
 
-// rota básica opcional (saúde do serviço)
-app.get('/', (_req, res) => res.send('brynix-bot ok'));
+// Endpoints simples (úteis para Render/healthcheck)
+app.get('/', (_req, res) => res.send('OK'));
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-// 4) inicializa WhatsApp e expõe endpoints (/wa-status, /wa-qr)
+// Inicializa WhatsApp e expõe /wa-status e /wa-qr via initWhatsApp(app)
 initWhatsApp(app);
 
-// 5) inicia o scheduler (tick minutely)
-startScheduler({ sendText, sendAudio, getClient });
-
-// 6) start http
-const PORT = process.env.PORT || 10000;
+// Sobe o HTTP
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });
+
+// Heartbeat do “scheduler” (apenas batimento/gancho para evolução futura)
+// A lógica de texto/TTS já está disponível pelos comandos ocultos:
+//   /__test daily   | /__test weekly   | /__test tts <texto>
+console.log(`[scheduler] iniciado (tick=${TICK_SECONDS}s)`);
+setInterval(() => {
+  // Aqui você pode invocar uma rotina real quando quiser, por ex.:
+  // runScheduledJobs().catch(console.error);
+}, TICK_SECONDS * 1000);
