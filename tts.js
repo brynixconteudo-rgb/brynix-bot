@@ -1,34 +1,37 @@
 // tts.js
-// Text-to-Speech Google (usa GOOGLE_SA_JSON)
-// Retorna Buffer OGG/Opus — perfeito p/ WhatsApp.
+// TTS opcional. Se não houver configuração adequada, retorna null.
+// Implementação usando OpenAI (modelo TTS).
+// VARS: OPENAI_API_KEY (obrigatória p/ TTS), TTS_MODEL (opcional; default gpt-4o-mini-tts)
 
-const { google } = require('googleapis');
+const OpenAI = require('openai');
 
-function getTTSClient() {
-  const raw = process.env.GOOGLE_SA_JSON;
-  if (!raw) throw new Error('GOOGLE_SA_JSON ausente.');
-  const sa = JSON.parse(raw.replace(/\n/g, '\\n'));
-  const jwt = new google.auth.JWT(
-    sa.client_email, null, sa.private_key,
-    ['https://www.googleapis.com/auth/cloud-platform']
-  );
-  return google.texttospeech({ version: 'v1', auth: jwt });
+const apiKey = process.env.OPENAI_API_KEY || '';
+const TTS_MODEL = process.env.TTS_MODEL || 'gpt-4o-mini-tts';
+
+let openai = null;
+if (apiKey) {
+  openai = new OpenAI({ apiKey });
 }
 
-/**
- * synthesize('Olá mundo', 'pt-BR-Neural2-A')
- * @returns {Promise<Buffer>} audio OGG_OPUS
- */
-async function synthesize(text, voiceName = 'pt-BR-Neural2-A', speakingRate = 1.02) {
-  const tts = getTTSClient();
-  const request = {
-    input: { text },
-    voice: { languageCode: 'pt-BR', name: voiceName },
-    audioConfig: { audioEncoding: 'OGG_OPUS', speakingRate },
-  };
-  const res = await tts.text.synthesize(request);
-  const audio = res.data.audioContent;
-  return Buffer.from(audio, 'base64');
+async function synthesize(text, opts = {}) {
+  try {
+    if (!openai) return null;
+    const voice = opts.voice || 'alloy';
+
+    // API de TTS do OpenAI – resposta como Buffer (mp3)
+    const resp = await openai.audio.speech.create({
+      model: TTS_MODEL,
+      voice,
+      input: text,
+      format: 'mp3',
+    });
+
+    const arrayBuffer = await resp.arrayBuffer();
+    return { mime: 'audio/mpeg', buffer: Buffer.from(arrayBuffer) };
+  } catch (e) {
+    console.error('[TTS] synthesize erro:', e?.message || e);
+    return null;
+  }
 }
 
 module.exports = { synthesize };
