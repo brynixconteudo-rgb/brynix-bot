@@ -1,187 +1,147 @@
 // drive.js
-// Upload de anexos do WhatsApp para o Google Drive usando OAuth (client ID/secret + refresh token).
-// Suporta os dois conjuntos de nomes de variáveis (os seus e os antigos):
+// Upload de anexos do WhatsApp para o Google Drive usando OAuth (usuário).
+// Suporta DOIS conjuntos de variáveis de ambiente (novas e antigas):
 //
-// Necessários (qualquer um dos pares):
-//  - GOOGLE_OAUTH_CLIENT_ID           || DRIVE_CLIENT_ID
-//  - GOOGLE_OAUTH_CLIENT_SECRET       || DRIVE_CLIENT_SECRET
-//  - GOOGLE_OAUTH_REFRESH_TOKEN       || DRIVE_REFRESH_TOKEN
-//  - GOOGLE_DRIVE_ROOT_FOLDER_ID      || DRIVE_ROOT_FOLDER_ID
-// Opcionais:
-//  - GOOGLE_OAUTH_REDIRECT_URI   (pode ficar em branco)
+// Novas (recomendadas):
+//   GOOGLE_OAUTH_CLIENT_ID
+//   GOOGLE_OAUTH_CLIENT_SECRET
+//   GOOGLE_OAUTH_REFRESH_TOKEN
+//   GOOGLE_DRIVE_ROOT_FOLDER_ID
+//   (opcional) GOOGLE_OAUTH_REDIRECT_URI
 //
+// Antigas (legacy):
+//   DRIVE_CLIENT_ID
+//   DRIVE_CLIENT_SECRET
+//   DRIVE_REFRESH_TOKEN
+//   DRIVE_ROOT_FOLDER_ID
+//
+// Exporta: saveIncomingMediaToDrive(client, msg, link)
+//   link = { sheetId, projectName }
+
 const { google } = require('googleapis');
+const { Readable } = require('stream');
 
-const OAUTH_CLIENT_ID =
-  process.env.GOOGLE_OAUTH_CLIENT_ID || process.env.DRIVE_CLIENT_ID || '';
-const OAUTH_CLIENT_SECRET =
-  process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.DRIVE_CLIENT_SECRET || '';
-const OAUTH_REFRESH_TOKEN =
-  process.env.GOOGLE_OAUTH_REFRESH_TOKEN || process.env.DRIVE_REFRESH_TOKEN || '';
-const ROOT_FOLDER_ID =
-  process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || process.env.DRIVE_ROOT_FOLDER_ID || '';
-const OAUTH_REDIRECT_URI =
-  process.env.GOOGLE_OAUTH_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob';
-
-function haveOAuth() {
-  return (
-    OAUTH_CLIENT_ID &&
-    OAUTH_CLIENT_SECRET &&
-    OAUTH_REFRESH_TOKEN &&
-    ROOT_FOLDER_ID
-  );
+function pickEnv(...keys) {
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v && String(v).trim()) return v;
+  }
+  return '';
 }
 
-function buildOAuth2Client() {
-  const oAuth2Client = new google.auth.OAuth2(
-    OAUTH_CLIENT_ID,
-    OAUTH_CLIENT_SECRET,
-    OAUTH_REDIRECT_URI
-  );
-  oAuth2Client.setCredentials({ refresh_token: OAUTH_REFRESH_TOKEN });
-  return oAuth2Client;
+function buildOAuthDrive() {
+  const CLIENT_ID = pickEnv('GOOGLE_OAUTH_CLIENT_ID', 'DRIVE_CLIENT_ID');
+  const CLIENT_SECRET = pickEnv('GOOGLE_OAUTH_CLIENT_SECRET', 'DRIVE_CLIENT_SECRET');
+  const REFRESH_TOKEN = pickEnv('GOOGLE_OAUTH_REFRESH_TOKEN', 'DRIVE_REFRESH_TOKEN');
+  const REDIRECT_URI = process.env.GOOGLE_OAUTH_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob';
+
+  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+    console.warn('[DRIVE] Variáveis ausentes para OAuth (CLIENT_ID/SECRET/REFRESH_TOKEN). Upload será ignorado.');
+    return null;
+  }
+
+  const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+  oAuth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
+  return google.drive({ version: 'v3', auth: oAuth2Client });
 }
 
-function driveClient() {
-  const auth = buildOAuth2Client();
-  return google.drive({ version: 'v3', auth });
-}
-
-async function findFolder(drive, name, parentId) {
+async function ensureFolder(drive, parentId, name) {
+  // Procura pasta pelo nome dentro do parent
   const q = [
-    `mimeType='application/vnd.google-apps.folder'`,
-    `name='${name.replace(/'/g, "\\'")}'`,
-    `trashed=false`
-  ];
-  if (parentId) q.push(`'${parentId}' in parents`);
+    `'${parentId}' in parents`,
+    `name = '${name.replace(/'/g, "\\'")}'`,
+    `mimeType = 'application/vnd.google-apps.folder'`,
+    'trashed = false'
+  ].join(' and ');
+
   const res = await drive.files.list({
-    q: q.join(' and '),
-    fields: 'files(id,name,parents)',
-    includeItemsFromAllDrives: true,
-    supportsAllDrives: true
+    q,
+    fields: 'files(id, name)',
+    pageSize: 1
   });
-  return (res.data.files && res.data.files[0]) || null;
-}
 
-async function ensureFolder(drive, name, parentId) {
-  const existing = await findFolder(drive, name, parentId);
-  if (existing) return existing.id;
+  if (res.data.files && res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
 
-  const file = await drive.files.create({
+  // cria
+  const folder = await drive.files.create({
     requestBody: {
       name,
       mimeType: 'application/vnd.google-apps.folder',
-      parents: parentId ? [parentId] : undefined
+      parents: [parentId]
     },
-    fields: 'id',
-    supportsAllDrives: true
+    fields: 'id, name'
   });
-  return file.data.id;
+
+  return folder.data.id;
 }
 
-function extFromMime(mime) {
-  if (!mime) return 'bin';
-  const map = {
-    'image/jpeg': 'jpg',
-    'image/png': 'png',
-    'image/webp': 'webp',
-    'application/pdf': 'pdf',
-    'audio/mpeg': 'mp3',
-    'audio/ogg': 'ogg',
-    'video/mp4': 'mp4',
-    'text/plain': 'txt'
-  };
-  return map[mime] || 'bin';
+function bufferToStream(buffer) {
+  const stream = new Readable();
+  stream.push(buffer);
+  stream.push(null);
+  return stream;
 }
 
-/**
- * Salva mídia recebida no grupo para a pasta do projeto no Drive.
- * Estrutura:
- *  ROOT_FOLDER /
- *    <ProjectName> /
- *      Documentos de Projeto /
- *        <arquivo>
- *
- * @param {Client} waClient
- * @param {Message} msg
- * @param {{sheetId: string, projectName: string}} link
- * @returns {Promise<{id: string, url?: string} | null>}
- */
-async function saveIncomingMediaToDrive(waClient, msg, link) {
+async function uploadBuffer(drive, parentId, name, mimeType, buffer) {
+  const res = await drive.files.create({
+    requestBody: {
+      name,
+      parents: [parentId]
+    },
+    media: {
+      mimeType,
+      body: bufferToStream(buffer)
+    },
+    fields: 'id, name, webViewLink, webContentLink'
+  });
+  return res.data;
+}
+
+async function saveIncomingMediaToDrive(client, msg, link) {
   try {
-    if (!haveOAuth()) {
-      console.warn(
-        '[DRIVE] Variáveis ausentes: ' +
-          [
-            OAUTH_CLIENT_ID ? '' : 'GOOGLE_OAUTH_CLIENT_ID/DRIVE_CLIENT_ID',
-            OAUTH_CLIENT_SECRET ? '' : 'GOOGLE_OAUTH_CLIENT_SECRET/DRIVE_CLIENT_SECRET',
-            OAUTH_REFRESH_TOKEN ? '' : 'GOOGLE_OAUTH_REFRESH_TOKEN/DRIVE_REFRESH_TOKEN',
-            ROOT_FOLDER_ID ? '' : 'GOOGLE_DRIVE_ROOT_FOLDER_ID/DRIVE_ROOT_FOLDER_ID'
-          ]
-            .filter(Boolean)
-            .join(', ')
-      );
+    const drive = buildOAuthDrive();
+    if (!drive) {
       console.warn('[DRIVE] Sem configuração de OAuth; upload ignorado.');
       return null;
     }
 
-    const media = await msg.downloadMedia();
-    if (!media || !media.data) {
-      console.warn('[DRIVE] Mensagem sem mídia baixável.');
+    const ROOT_ID = pickEnv('GOOGLE_DRIVE_ROOT_FOLDER_ID', 'DRIVE_ROOT_FOLDER_ID');
+    if (!ROOT_ID) {
+      console.warn('[DRIVE] ROOT_FOLDER_ID ausente; defina GOOGLE_DRIVE_ROOT_FOLDER_ID (ou DRIVE_ROOT_FOLDER_ID).');
       return null;
     }
 
-    const drive = driveClient();
+    // Baixa mídia do WhatsApp
+    if (!msg.hasMedia) return null;
+    const media = await msg.downloadMedia(); // { data (base64), mimetype, filename? }
+    if (!media || !media.data) return null;
 
-    // Pastas do projeto
-    const projectFolderId = await ensureFolder(
-      drive,
-      (link.projectName || 'Projeto').trim(),
-      ROOT_FOLDER_ID
-    );
-    const docsFolderId = await ensureFolder(
-      drive,
-      'Documentos de Projeto',
-      projectFolderId
-    );
+    const buf = Buffer.from(media.data, 'base64');
+    const mime = media.mimetype || 'application/octet-stream';
 
     // Nome do arquivo
-    const mime = media.mimetype || 'application/octet-stream';
-    const ext = extFromMime(mime);
-    const when = new Date();
-    const baseName =
-      (msg._data?.filename ||
-        (link.projectName || 'arquivo')
-          .normalize('NFD')
-          .replace(/[^\w\s-]/g, '')
-          .trim()
-          .replace(/\s+/g, '_')) + `_${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(2, '0')}-${String(when.getHours()).padStart(2, '0')}${String(when.getMinutes()).padStart(2, '0')}`;
-    const fileName = `${baseName}.${ext}`;
+    const ts = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = `${ts.getFullYear()}-${pad(ts.getMonth() + 1)}-${pad(ts.getDate())}_${pad(ts.getHours())}-${pad(ts.getMinutes())}-${pad(ts.getSeconds())}`;
+    const baseName = media.filename || `anexo_${stamp}`;
+    const safeName = baseName.replace(/[\\/:*?"<>|]/g, '_');
 
-    // Upload
-    const res = await drive.files.create({
-      requestBody: {
-        name: fileName,
-        parents: [docsFolderId]
-      },
-      media: {
-        mimeType: mime,
-        body: Buffer.from(media.data, 'base64')
-      },
-      fields: 'id, webViewLink, webContentLink',
-      supportsAllDrives: true
-    });
+    // Estrutura de pastas: ROOT -> <Projeto> -> "Documentos de Projeto"
+    const projectName = (link?.projectName || 'Projeto').trim();
+    const projectFolderId = await ensureFolder(drive, ROOT_ID, projectName);
+    const docsFolderId = await ensureFolder(drive, projectFolderId, 'Documentos de Projeto');
 
-    const fileId = res.data.id;
-    const url = res.data.webViewLink || res.data.webContentLink || `https://drive.google.com/file/d/${fileId}/view`;
+    const file = await uploadBuffer(drive, docsFolderId, safeName, mime, buf);
 
-    return { id: fileId, url };
+    // Link de visualização
+    const url = file.webViewLink || file.webContentLink || `https://drive.google.com/file/d/${file.id}/view`;
+    return { id: file.id, url };
   } catch (e) {
     console.error('[DRIVE] erro upload:', e?.message || e);
     return null;
   }
 }
 
-module.exports = {
-  saveIncomingMediaToDrive
-};
+module.exports = { saveIncomingMediaToDrive };
