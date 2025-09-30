@@ -1,56 +1,53 @@
-// ai.js  — compatível com openai@^4.x (SDK novo)
+// ai.js
+// Respostas 1:1 (modo Analista) com tom natural e conhecimento estático da BRYNIX.
+// Sem browsing. Usa OPENAI opcionalmente para reformular (se quiser mais "humanizado").
 
 const OpenAI = require('openai');
+const openaiKey = process.env.OPENAI_API_KEY || '';
+const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const BRYNIX_KB = {
+  site: 'https://brynix.ai',
+  quemSomos: 'A BRYNIX ajuda PMEs a acelerar resultados com IA, focando em eficiência gerencial, automação de processos e crescimento de receita.',
+  ofertas: [
+    'Diagnóstico Inteligente (assessment rápido, mapa de oportunidades)',
+    'Automação e copilots para processos comerciais e operacionais',
+    'Análises e previsões com IA (vendas, churn, estoque)',
+    'Treinamento e governança para adoção de IA'
+  ],
+  abordagem: 'Começamos por um diagnóstico (baixo atrito e alto impacto), priorizamos ganhos rápidos e evoluímos com um roadmap de automações e copilots.'
+};
 
-// Pequena “identidade” da BRYNIX para respostas 1:1
-const BRYNIX_SYSTEM_PROMPT = `
-Você é o assistente da BRYNIX (brynix.com.br). Fale em PT-BR, tom profissional e próximo.
-Missão: ajudar PMEs a acelerar resultados com IA (eficiência gerencial, automação de processos, geração de receita).
-Quando perguntarem sobre ofertas/serviços/metodologia, responda de forma objetiva e convidativa.
-Se o assunto fugir do escopo BRYNIX, puxe gentilmente para temas de IA aplicada a negócios.
-Evite jargões técnicos desnecessários. Use markdown leve (títulos curtos, listas).
-`;
+function answerFromKB(text) {
+  const t = (text || '').toLowerCase();
+  if (t.includes('oferta') || t.includes('servi') || t.includes('fazem')) {
+    return `A BRYNIX oferece: \n• ${BRYNIX_KB.ofertas.join('\n• ')}\n\nSite: ${BRYNIX_KB.site}`;
+  }
+  if (t.includes('site') || t.includes('website') || t.includes('url')) {
+    return `Nosso site é ${BRYNIX_KB.site}`;
+  }
+  if (t.includes('quem é') || t.includes('quem sao') || t.includes('sobre') || t.includes('brynix')) {
+    return `${BRYNIX_KB.quemSomos}\n\nAbordagem: ${BRYNIX_KB.abordagem}\nSite: ${BRYNIX_KB.site}`;
+  }
+  return null;
+}
 
-/**
- * Gera uma resposta de IA (usado no 1:1 / fora de contexto de projeto).
- * @param {string} userText - texto do usuário
- * @param {object} ctx - { from, pushName } (opcional)
- * @returns {Promise<string>}
- */
-async function generateReply(userText, ctx = {}) {
-  const name = ctx.pushName ? String(ctx.pushName).trim() : 'cliente';
+async function generateReply(text, ctx={}) {
+  const kb = answerFromKB(text);
+  let base = kb || `Entendi. Posso explicar nossa abordagem e como aplicamos IA de forma prática: ${BRYNIX_KB.abordagem}. Tem um desafio específico que você quer atacar primeiro?`;
 
-  const messages = [
-    { role: 'system', content: BRYNIX_SYSTEM_PROMPT },
-    {
-      role: 'user',
-      content: `Nome do usuário: ${name}\n\nPergunta/mensagem:\n${userText}`,
-    },
-  ];
-
+  if (!openai) return base;
   try {
-    // Você pode usar "gpt-4o-mini" ou outro compatível na sua conta
-    const completion = await client.chat.completions.create({
+    const prompt = `Reescreva de forma amigável, clara e curta (português do Brasil), como se fosse uma especialista atenciosa: """${base}"""`;
+    const r = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      messages,
+      messages: [{ role: 'user', content: prompt }],
       temperature: 0.4,
     });
-
-    const text =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      'Posso te ajudar com mais detalhes sobre a BRYNIX e como aplicamos IA no seu negócio.';
-
-    return text;
-  } catch (err) {
-    console.error('[AI] Erro na OpenAI:', err?.response?.data || err);
-    return 'Tive um imprevisto técnico ao consultar a IA agora. Pode repetir em instantes?';
+    return r.choices?.[0]?.message?.content?.trim() || base;
+  } catch {
+    return base;
   }
 }
 
-module.exports = {
-  generateReply,
-};
+module.exports = { generateReply };
