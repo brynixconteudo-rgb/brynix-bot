@@ -1,14 +1,15 @@
 // sheets.js
-// Acesso ao Google Sheets usando Service Account JSON (env GOOGLE_SA_JSON).
-// Helpers: resolver ID, ler metadados, listar tarefas, ler config de projeto.
+// Acesso ao Google Sheets usando Service Account JSON da env GOOGLE_SA_JSON.
+// Helpers: meta do projeto, tarefas, recursos, logging e utilidades.
 
 const { google } = require('googleapis');
 
 function parseServiceAccount() {
   const raw = process.env.GOOGLE_SA_JSON || '';
   if (!raw) throw new Error('GOOGLE_SA_JSON ausente.');
-  try { return JSON.parse(raw); }
-  catch {
+  try {
+    return JSON.parse(raw);
+  } catch {
     return JSON.parse(raw.replace(/\n/g, '\\n'));
   }
 }
@@ -19,7 +20,7 @@ function buildSheetsClient() {
     sa.client_email,
     null,
     sa.private_key,
-    ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+    ['https://www.googleapis.com/auth/spreadsheets']
   );
   return google.sheets({ version: 'v4', auth: jwt });
 }
@@ -32,11 +33,13 @@ function extractSheetId(urlOrId) {
   return null;
 }
 
+/* ===================== Metadados ===================== */
+
 async function readProjectMeta(sheetId) {
   const sheets = buildSheetsClient();
   const meta = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: 'Dados_Projeto!A1:B200',
+    range: 'Dados_Projeto!A1:B50',
   });
   const rows = meta.data.values || [];
   const obj = {};
@@ -44,63 +47,131 @@ async function readProjectMeta(sheetId) {
     if (!k) return;
     obj[String(k).trim()] = (v || '').toString().trim();
   });
-  return obj;
+  return obj; // { ProjectName, GroupId, Timezone, DailyReminderTime, WeeklyWrap, QuietHours, ... }
 }
 
-async function readProjectConfig(sheetId) {
-  const m = await readProjectMeta(sheetId);
-  const cfg = {
-    ProjectName: m.ProjectName || 'Projeto',
-    Timezone: m.Timezone || 'America/Sao_Paulo',
-    DailyReminderTime: (m.DailyReminderTime || '09:00').replace(/\s/g, ''),
-    WeeklyWrap: (m.WeeklyWrap || 'FRI 17:30').replace(/\s/g, ' '),
-    QuietHours: (m.QuietHours || '20:00-08:00').replace(/\s/g, ''),
-    ProjectObjectives: m.ProjectObjectives || '',
-    ProjectBenefits: m.ProjectBenefits || '',
-    ProjectTimeline: m.ProjectTimeline || '',
-    TTS_Enabled: /^true$/i.test(m.TTS_Enabled || ''),
-    TTS_Voice: m.TTS_Voice || 'pt-BR-Neural2-A',
-    MentionsEnabled: /^true$/i.test(m.MentionsEnabled || ''),
-  };
-  return cfg;
+async function writeMeta(sheetId, key, value) {
+  const sheets = buildSheetsClient();
+  // procura linha do key e escreve na coluna B
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: 'Dados_Projeto!A1:B50',
+  });
+  const rows = resp.data.values || [];
+  let rowIndex = rows.findIndex(r => (r[0] || '').trim() === key);
+  if (rowIndex < 0) rowIndex = rows.length;
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: sheetId,
+    range: `Dados_Projeto!B${rowIndex + 1}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [[value]] },
+  });
 }
 
-async function readTasks(sheetId) {
+async function saveGroupId(sheetId, groupId) {
+  return writeMeta(sheetId, 'GroupId', groupId);
+}
+
+/* ===================== Recursos ===================== */
+
+async function readResources(sheetId) {
   const sheets = buildSheetsClient();
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: sheetId,
-    range: 'Tarefas!A1:K1000',
+    range: 'Rec_Projeto!A1:E1000', // Nome | Função | Contato | Status | ...
   });
   const rows = resp.data.values || [];
   if (rows.length < 2) return [];
   const header = rows[0].map(h => (h || '').toString().trim().toLowerCase());
   const idx = {
+    nome: header.indexOf('nome'),
+    funcao: header.indexOf('função') >= 0 ? header.indexOf('função') : header.indexOf('funcao'),
+    contato: header.indexOf('contato'),
+    status: header.indexOf('status'),
+  };
+  return rows.slice(1).map(r => ({
+    nome: r[idx.nome] || '',
+    funcao: r[idx.funcao] || '',
+    contato: r[idx.contato] || '',
+    status: r[idx.status] || '',
+  })).filter(x => x.nome);
+}
+
+/* ===================== Tarefas ===================== */
+
+function parseBRDate(s) {
+  const m = (s || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (!m) return null;
+  const d = +m[1], mo = +m[2]-1, y = +m[3] + (m[3].length===2?2000:0);
+  return new Date(y, mo, d);
+}
+
+async function readTasks(sheetId) {
+  const sheets = buildSheetsClient();
+  // Esperado: Tarefa | Prioridade | Responsável | Status | Data de início | Data de término | Marco | Observações
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: 'Tarefas!A1:K2000',
+  });
+  const rows = resp.data.values || [];
+  if (rows.length < 2) return [];
+
+  const header = rows[0].map(h => (h || '').toString().trim().toLowerCase());
+  const idx = {
     tarefa: header.indexOf('tarefa'),
     prioridade: header.indexOf('prioridade'),
-    responsavel: header.indexOf('responsável'),
+    responsavel: header.indexOf('responsável') >= 0 ? header.indexOf('responsável') : header.indexOf('responsavel'),
     status: header.indexOf('status'),
     dtini: header.indexOf('data de início'),
     dtfim: header.indexOf('data de término'),
     marco: header.indexOf('marco'),
-    obs: header.indexOf('observações'),
+    obs: header.indexOf('observações') >=0 ? header.indexOf('observações') : header.indexOf('observacoes'),
   };
-  const tasks = rows.slice(1).map(r => ({
-    tarefa: r[idx.tarefa] || '',
-    prioridade: r[idx.prioridade] || '',
-    responsavel: r[idx.responsavel] || '',
-    status: r[idx.status] || '',
-    dataInicio: r[idx.dtini] || '',
-    dataTermino: r[idx.dtfim] || '',
-    marco: r[idx.marco] || '',
-    observacoes: r[idx.obs] || '',
-  })).filter(t => t.tarefa);
-  return tasks;
+
+  return rows.slice(1).map(r => {
+    const dataInicio = r[idx.dtini] || '';
+    const dataTermino = r[idx.dtfim] || '';
+    return {
+      tarefa: r[idx.tarefa] || '',
+      prioridade: r[idx.prioridade] || '',
+      responsavel: r[idx.responsavel] || '',
+      status: r[idx.status] || '',
+      dataInicio,
+      dataTermino,
+      dtIniDate: parseBRDate(dataInicio),
+      dtFimDate: parseBRDate(dataTermino),
+      marco: r[idx.marco] || '',
+      observacoes: r[idx.obs] || '',
+    };
+  }).filter(t => t.tarefa);
 }
 
-function buildStatusSummary(projectName, tasks) {
-  const B = s => `*${s}*`;
-  const I = s => `_${s}_`;
+/* ===================== LOG ===================== */
 
+async function appendLog(sheetId, payload) {
+  // Aba: Atualizacao_LOG => Timestamp | Tipo | Autor | Mensagem | Arquivo | Link_GDrive | Observações
+  const sheets = buildSheetsClient();
+  const ts = new Date().toISOString();
+  const row = [
+    ts,
+    payload.tipo || '',
+    payload.autor || '',
+    payload.msg || '',
+    payload.arquivo || '',
+    payload.link || '',
+    payload.obs || '',
+  ];
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: sheetId,
+    range: 'Atualizacao_LOG!A1:G1',
+    valueInputOption: 'RAW',
+    requestBody: { values: [row] },
+  });
+}
+
+/* ===================== Sumários ===================== */
+
+function buildStatusSummary(projectName, tasks) {
   const total = tasks.length;
   const byStatus = tasks.reduce((acc, t) => {
     const s = (t.status || 'Sem status').trim();
@@ -112,26 +183,32 @@ function buildStatusSummary(projectName, tasks) {
     .map(([s, n]) => `• ${s}: ${n}`)
     .join('\n');
 
+  // Abertas = não concluídas
   const abertas = tasks
     .filter(t => !/conclu(i|í)da/i.test(t.status || ''))
     .slice(0, 10);
-  const preview = abertas
-    .map(t => `- ${t.tarefa} (${t.responsavel || 's/resp'})`)
-    .join('\n') || 'Nenhuma aberta.';
 
-  return `${B(`${projectName || 'Projeto'} — Status`)}
+  const preview = abertas.map(t => {
+    const datas = [];
+    if (t.dataInicio) datas.push(`ini ${t.dataInicio}`);
+    if (t.dataTermino) datas.push(`fim ${t.dataTermino}`);
+    const dat = datas.length ? ` — ${datas.join(' | ')}` : '';
+    return `- ${t.tarefa} (${t.responsavel || 's/resp'})${dat}`;
+  }).join('\n') || 'Nenhuma aberta.';
 
-Total de tarefas: ${total}
-${topStatuses}
-
-${B('Abertas (amostra):')}
-${preview}`;
+  return `*${projectName || 'Projeto'} — Status:*\n` +
+         `Total de tarefas: ${total}\n` +
+         `${topStatuses}\n\n` +
+         `*Abertas (amostra):*\n${preview}`;
 }
 
 module.exports = {
   extractSheetId,
   readProjectMeta,
-  readProjectConfig,
+  writeMeta,
+  saveGroupId,
   readTasks,
+  readResources,
+  appendLog,
   buildStatusSummary,
 };
