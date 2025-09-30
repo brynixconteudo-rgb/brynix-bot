@@ -1,343 +1,358 @@
 // whatsapp.js
-// Roteador WhatsApp: grupo (GP) vs 1:1 (BRYNIX), menu numérico, TTS oculto, ping e upload.
+// Motor da Alice: roteamento de mensagens, binds, menu, uploads, resumos, 1:1 analista.
 
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
-const { synthesize } = require('./tts'); // /__say
-const { extractSheetId, readTasks, buildStatusSummary, readProjectMeta } = require('./sheets');
-const { saveIncomingMediaToDrive } = require('./drive');
+const {
+  extractSheetId, readProjectMeta, readTasks, readResources,
+  appendLog, buildStatusSummary, saveGroupId
+} = require('./sheets');
 
-const BOT_ALIASES = (process.env.BOT_ALIASES || 'bot,alice').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const { saveIncomingMediaToDrive } = require('./drive');
+const { generateReply } = require('./ai');
+const { createScheduler } = require('./scheduler');
+
 const SESSION_PATH = process.env.WA_SESSION_PATH || '/var/data/wa-session';
-const REINIT_COOLDOWN_MS = 30_000;
 const WATCHDOG_INTERVAL_MS = 60_000;
 
 let client;
 let currentState = 'starting';
 let lastQr = '';
-let reinitNotBefore = 0;
 
-// Estado por chat
-const muteMap = new Map();          // chatId -> boolean
-const linkMap = new Map();          // chatId -> { sheetId, projectName }
-const menuWindow = new Map();       // chatId -> { expiresAt: timestamp }
+/** binds em memória: chatId -> { sheetId, projectName } */
+const linkMap = new Map();
+/** mute por chatId */
+const muteMap = new Map();
+/** aliases do bot para menções */
+const BOT_ALIASES = (process.env.BOT_ALIASES || 'Alice').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
-// helpers de texto
+/* util formatação */
 const B = s => `*${s}*`;
 const I = s => `_${s}_`;
-const OK = '✅';
-const NO = '❌';
-const WARN = '⚠️';
 
-// ------------- infra básica -------------
-function buildClient() {
-  return new Client({
-    authStrategy: new LocalAuth({ clientId: 'brynix-bot', dataPath: SESSION_PATH }),
-    puppeteer: {
-      headless: true,
-      timeout: 60_000,
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process']
-    },
-    restartOnAuthFail: true,
-    takeoverOnConflict: true,
-    takeoverTimeoutMs: 5_000,
-  });
-}
+/* ------------- Helpers UI ------------- */
 
-async function safeReinit(reason='unknown') {
-  const now = Date.now();
-  if (now < reinitNotBefore) return;
-  reinitNotBefore = now + REINIT_COOLDOWN_MS;
-  try { if (client) await client.destroy().catch(()=>{}); } catch(_){}
-  client = buildClient();
-  wireEvents(client);
-  client.initialize();
-}
-
-function getLastQr(){ return lastQr; }
-
-// ------------- util -------------
-function isGroupMsg(msg){ return msg.from.endsWith('@g.us'); }
-function mentionedBot(textRaw) {
-  const t = (textRaw||'').toLowerCase();
-  return BOT_ALIASES.some(a => t.includes(`@${a}`) || t.includes(a));
-}
-function chunk(text, max=3500) {
-  if (!text) return [''];
-  const parts = [];
-  for (let i=0;i<text.length;i+=max) parts.push(text.slice(i, i+max));
-  return parts;
-}
-async function safeReply(msg, text){
-  for (const part of chunk(text)) await msg.reply(part);
-}
-
-// ------------- UI: menu -------------
-function menuCard(projectName='Assistente de Projeto') {
-  const title = `${projectName} — Painel Rápido`;
+function menuCard(projectName) {
   return [
-    `🪄 ${B(title)}`,
-    '',
-    `1⃣  ${B('Resumo')}  →  /summary | /brief`,
-    `2⃣  ⏭️  ${B('Próximos')}  →  /next`,
-    `3⃣  🕒  ${B('Atrasadas')}  →  /late`,
-    `4⃣  🔔  ${B('Lembrete agora')}  →  /remind now`,
-    `5⃣  📝  ${B('Nota rápida')}  →  /note <texto>`,
-    `6⃣  👥  ${B('Pessoas')}  →  /who`,
-    `7⃣  🤫  ${B('Silenciar')}  →  /mute on  ( /mute off para voltar )`,
-    '',
-    I('Dica: responda com o número da opção por até 2 minutos.')
+    `✨ ${B(projectName || 'Projeto')} — Painel Rápido`,
+    ``,
+    `1️⃣ ${B('Resumo')}  →  /summary | /brief`,
+    `2️⃣ ⏭ ${B('Próximos')}  →  /next`,
+    `3️⃣ ⏰ ${B('Atrasadas')}  →  /late`,
+    `4️⃣ 🔔 ${B('Lembrete agora')}  →  /remind now`,
+    `5️⃣ 🧾 ${B('Nota rápida')}  →  /note <texto>`,
+    `6️⃣ 👥 ${B('Pessoas')}  →  /who`,
+    `7️⃣ 🤫 ${B('Silenciar')}  →  /mute on  ( /mute off para voltar )`,
+    ``,
+    I('Dica: responda com o número da opção.')
   ].join('\n');
 }
-function openMenuWindow(chatId, ms=120_000){
-  menuWindow.set(chatId, { expiresAt: Date.now() + ms });
+
+function wasBotMentioned(msg) {
+  const lower = (msg.body || '').toLowerCase();
+  const matchedAlias = BOT_ALIASES.some(a => lower.includes('@'+a) || lower.includes(a));
+  return (msg.mentionedIds && msg.mentionedIds.length) || matchedAlias;
 }
-function isMenuOpen(chatId){
-  const w = menuWindow.get(chatId);
-  if (!w) return false;
-  if (Date.now() > w.expiresAt){ menuWindow.delete(chatId); return false; }
+
+function chunkText(text, limit = 3500) {
+  const parts = [];
+  for (let i=0;i<text.length;i+=limit) parts.push(text.slice(i, i+limit));
+  return parts;
+}
+async function safeReply(msg, text) {
+  for (const part of chunkText(text)) await msg.reply(part);
+}
+
+/* ------------- Scheduler integration ------------- */
+const scheduler = createScheduler({
+  getBindings: () => Array.from(linkMap.entries()).map(([groupId, v]) => ({ groupId, sheetId: v.sheetId, projectName: v.projectName })),
+  sendToGroup: async (groupId, payload, meta={}) => {
+    try {
+      if (!client) return;
+      if (meta.audio) {
+        const media = new MessageMedia(payload.mime || 'audio/mpeg', payload.buffer.toString('base64'), 'resumo.mp3');
+        await client.sendMessage(groupId, media, { sendAudioAsVoice: false });
+      } else {
+        await client.sendMessage(groupId, payload);
+      }
+    } catch (e) { console.log('[sendToGroup] erro', e?.message || e); }
+  },
+  tts: async (text) => {
+    // usa TTS via openai (já configurado no projeto) — se quiser Google, trocar aqui
+    const tts = require('./tts');
+    const r = await tts.synthesize(text, { voice: process.env.TTS_VOICE || 'alloy' });
+    return r ? { mime: r.mime, buffer: r.buffer } : null;
+  }
+});
+
+/* ------------- Comandos ------------- */
+
+async function handleSetup(msg, text) {
+  const parts = text.split('|');
+  const sheetRaw = (parts[0] || '').replace(/\/setup/i, '').trim();
+  const projectName = (parts[1] || '').trim();
+
+  const sheetId = extractSheetId(sheetRaw);
+  if (!sheetId || !projectName) {
+    return msg.reply('⚠️ Use: /setup <sheetId|url> | <Nome do Projeto>');
+  }
+
+  const chatId = msg.from;
+  linkMap.set(chatId, { sheetId, projectName });
+
+  // salva GroupId na planilha (se grupo)
+  if (chatId.endsWith('@g.us')) {
+    try { await saveGroupId(sheetId, chatId); } catch {}
+  }
+
+  await appendLog(sheetId, { tipo:'setup', autor:'bot', msg:`vinculado ao grupo ${chatId}`, arquivo:'', link:'', obs:projectName });
+  return safeReply(msg, `✅ ${B('Projeto vinculado!')}\n\n• Planilha: ${sheetId}\n• Nome: ${projectName}\n${chatId.endsWith('@g.us')?`• GroupId: ${chatId}`:''}`);
+}
+
+async function handleWho(msg, link) {
+  const list = await readResources(link.sheetId);
+  const lines = list.length ? list.map(p => `• ${p.nome} — ${p.funcao}${p.contato ? ` (${p.contato})` : ''}`).join('\n') : 'Sem registros na aba Rec_Projeto.';
+  await appendLog(link.sheetId, { tipo:'who', autor:'bot', msg:`${list.length} membros`, arquivo:'', link:'', obs:'' });
+  return safeReply(msg, `${B(`${link.projectName} — Participantes`)}\n${lines}`);
+}
+
+async function handleSummary(msg, link, { brief=false } = {}) {
+  const tasks = await readTasks(link.sheetId);
+  const text = buildStatusSummary(link.projectName, tasks);
+  await appendLog(link.sheetId, { tipo:'summary', autor:'bot', msg:`OK (${tasks.length} tarefas)`, arquivo:link.sheetId, link:'', obs: brief?'brief':'' });
+  return safeReply(msg, text);
+}
+
+async function handleNext(msg, link) {
+  const tasks = await readTasks(link.sheetId);
+  const today = new Date(); const tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate()+1);
+  const trunc = (dt)=> new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+  const due = tasks.filter(t => {
+    if (!t.dtFimDate) return false;
+    const od = trunc(t.dtFimDate), td = trunc(today);
+    return (+od===+td) || (+od===+tomorrow);
+  }).slice(0,10);
+
+  const lines = due.length
+    ? due.map(t => `• ${t.tarefa} — fim ${t.dataTermino}${t.responsavel?` (${t.responsavel})`:''}`).join('\n')
+    : 'Nenhuma tarefa para hoje/amanhã.';
+
+  await appendLog(link.sheetId, { tipo:'next', autor:'bot', msg:`${due.length} itens`, arquivo:'', link:'', obs:'' });
+  return safeReply(msg, `${B(`${link.projectName} — Próximos (hoje/amanhã)`)}\n${lines}`);
+}
+
+async function handleLate(msg, link) {
+  const tasks = await readTasks(link.sheetId);
+  const atrasadas = tasks.filter(t => /atrasad/i.test(t.status||'')).slice(0,10);
+  const lines = atrasadas.length
+    ? atrasadas.map(t => `• ${t.tarefa} — fim ${t.dataTermino}${t.responsavel?` (${t.responsavel})`:''}`).join('\n')
+    : 'Sem atrasadas. 👌';
+
+  await appendLog(link.sheetId, { tipo:'late', autor:'bot', msg:`${atrasadas.length} itens`, arquivo:'', link:'', obs:'' });
+  return safeReply(msg, `${B(`${link.projectName} — Atrasadas (top 10)`)}\n${lines}`);
+}
+
+async function handleNote(msg, link, noteText) {
+  if (!noteText) return msg.reply(`⚠️ Use: /note <texto>`);
+  await appendLog(link.sheetId, { tipo:'note', autor: msg._data?.notifyName || 'alguém', msg: noteText, arquivo:'', link:'', obs:'' });
+  return msg.reply(`✅ Nota registrada.`);
+}
+
+async function handleRemindNow(msg, link) {
+  return handleSummary(msg, link, { brief:false });
+}
+
+/* ------------- Upload ------------- */
+async function handleUploadIfAny(c, msg, link) {
+  if (!msg.hasMedia) return false;
+  try {
+    const res = await saveIncomingMediaToDrive(c, msg, link);
+    if (res?.url) {
+      await appendLog(link.sheetId, { tipo:'upload', autor: msg._data?.notifyName || 'alguém', msg: 'arquivo salvo', arquivo:'', link: res.url, obs:'' });
+      await safeReply(msg, `✅ Arquivo salvo em ${B(link.projectName)}.\n🔗 ${res.url}`);
+    } else {
+      await appendLog(link.sheetId, { tipo:'upload', autor: 'bot', msg: 'falha upload', arquivo:'', link:'', obs:'' });
+      await msg.reply('❌ Não consegui salvar no Drive.');
+    }
+  } catch (e) {
+    console.log('[upload] erro', e?.message || e);
+    await msg.reply('❌ Não consegui salvar no Drive.');
+  }
   return true;
 }
 
-// ------------- Ações GP -------------
-async function actSummary(msg, link) {
-  const tasks = await readTasks(link.sheetId);
-  const card = buildStatusSummary(link.projectName, tasks);
-  await safeReply(msg, card);
-}
-async function actSummaryBrief(msg, link) {
-  const tasks = await readTasks(link.sheetId);
-  const total = tasks.length;
-  const byStatus = tasks.reduce((acc,t)=>{
-    const s=(t.status||'Sem status').trim(); acc[s]=(acc[s]||0)+1; return acc;
-  },{});
-  const top = Object.entries(byStatus).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([s,n])=>`• ${s}: ${n}`).join('\n') || '• Sem dados';
-  await safeReply(msg, `${B(`${link.projectName} — Resumo Rápido`)}\nTotal: ${total}\n${top}`);
-}
-function parseDateBR(s){
-  const m = (s||'').match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-  if(!m) return null; const d=+m[1], mo=+m[2]-1, y=+m[3]+(m[3].length===2?2000:0); return new Date(y,mo,d);
-}
-async function actNext(msg, link) {
-  const tasks = await readTasks(link.sheetId);
-  const today = new Date(); const tomorrow = new Date(today.getFullYear(),today.getMonth(),today.getDate()+1);
-  const trunc = dt => new Date(dt.getFullYear(),dt.getMonth(),dt.getDate());
-  const due = tasks.filter(t=>{
-    const dt=parseDateBR(t.dataTermino||t.dataFim||''); if(!dt) return false;
-    const od=trunc(dt), td=trunc(today);
-    return (+od===+td)||(+od===+tomorrow);
-  }).slice(0,8);
-  const lines = due.length ? due.map(t=>`• ${t.tarefa} ${I(t.responsavel?`(${t.responsavel})`:'')}`).join('\n') : 'Nenhuma tarefa para hoje/amanhã.';
-  await safeReply(msg, `${B(`${link.projectName} — Próximos (hoje/amanhã)`)}\n${lines}`);
-}
-async function actLate(msg, link) {
-  const tasks = await readTasks(link.sheetId);
-  const atrasadas = tasks.filter(t=>/atrasad/i.test(t.status||'')).slice(0,8);
-  const lines = atrasadas.length ? atrasadas.map(t=>`• ${t.tarefa} ${I(t.responsavel?`(${t.responsavel})`:'')}`).join('\n') : 'Sem atrasadas. 👌';
-  await safeReply(msg, `${B(`${link.projectName} — Atrasadas (top 8)`)}\n${lines}`);
-}
-async function actWho(msg, link) {
-  // Lê metadados só p/ citar nome; se você já tem uma aba de recursos com nomes, adapte aqui
-  const meta = await readProjectMeta(link.sheetId).catch(()=>({}));
-  const title = `${link.projectName} — Participantes`;
-  const hint = I('Dica: em breve — “@Alice pendências do <nome>”.');
-  await safeReply(msg, `${B(title)}\n• Integrantes conforme planilha/WhatsApp do grupo.\n${hint}`);
+/* ------------- Bind / Group utils ------------- */
+async function ensureAutoBind(groupId, link) {
+  try {
+    const meta = await readProjectMeta(link.sheetId);
+    if (!meta.GroupId) await saveGroupId(link.sheetId, groupId);
+  } catch {}
 }
 
-// ------------- Perfil 1:1 (BRYNIX) -------------
-async function handleBrynixDM(msg, text) {
-  const low = (text||'').toLowerCase().trim();
+/* ------------- Wire ------------- */
 
-  if (low === '/ajuda' || low === '/help') {
-    return safeReply(msg,
-      B('Como posso ajudar?') + '\n' +
-      '• Fale comigo sobre a BRYNIX (o que fazemos, ofertas, metodologia, cases)\n' +
-      '• Para projetos, me adicione num grupo e use /setup para vincular à planilha.\n' +
-      I('Comandos técnicos: /ping, /__say <texto> (áudio).')
-    );
-  }
-
-  // Ping oculto
-  if (low === '/ping') {
-    return msg.reply('pong 🏓');
-  }
-
-  // TTS oculto
-  if (low.startsWith('/__say')) {
-    const say = text.replace(/^\/__say/i,'').trim();
-    if (!say) return msg.reply('Diga algo após /__say');
-    const audio = await synthesize(say, { voice: process.env.TTS_VOICE || 'alloy' });
-    if (!audio) return msg.reply('Não consegui gerar o áudio agora.');
-    const media = new MessageMedia(audio.mime, audio.buffer.toString('base64'));
-    return client.sendMessage(msg.from, media, { sendAudioAsVoice: true });
-  }
-
-  // Resposta institucional simples (pode evoluir)
-  const resposta =
-`A *BRYNIX* ajuda PMEs a acelerar resultados com IA.
-Atuamos em eficiência gerencial, automação de processos e *crescimento de receita*.
-
-Se quiser, diga “/ajuda” para ver dicas rápidas ou me coloque num grupo de projeto que eu organizo tudo por lá.`;
-
-  return safeReply(msg, resposta);
+function buildClient() {
+  return new Client({
+    authStrategy: new LocalAuth({ clientId: 'brynix-bot', dataPath: SESSION_PATH }),
+    puppeteer: { headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process'] },
+    restartOnAuthFail: true, takeoverOnConflict: true, takeoverTimeoutMs: 5_000,
+  });
 }
 
-// ------------- Wire de eventos -------------
-function wireEvents(c){
-  c.on('qr', async (qr) => { lastQr = qr; currentState='qr'; console.log('[WA] QR gerado'); });
+function getLastQr() { return lastQr; }
+
+function wireEvents(c) {
+  c.on('qr', (qr) => { lastQr = qr; currentState = 'qr'; console.log('[WA] QR gerado'); });
   c.on('authenticated', () => console.log('[WA] Autenticado'));
   c.on('ready', () => { currentState='ready'; console.log('[WA] Pronto ✅'); });
-  c.on('auth_failure', (m)=>{ console.error('[WA] auth_failure', m); safeReinit('auth_failure'); });
-  c.on('disconnected', (r)=>{ currentState='disconnected'; console.error('[WA] Desconectado', r); safeReinit('disconnected'); });
 
   c.on('message', async (msg) => {
     try {
       const chat = await msg.getChat();
       const isGroup = chat.isGroup;
+      const text = (msg.body || '').trim();
+      const isCommand = text.startsWith('/');
       const chatId = msg.from;
-      const text = msg.body || '';
-      const low = text.trim().toLowerCase();
-      const isCommand = low.startsWith('/');
 
-      // -------------- DESMUTAR SEMPRE FUNCIONA --------------
-      if (isCommand && /^\/(mute\s+off|silencio\s+off)$/i.test(low)) {
-        muteMap.delete(chatId);
-        return msg.reply(I('voltei a falar 😉'));
-      }
-
-      // DM (1:1 BRYNIX)
+      // 1) 1:1 — analista
       if (!isGroup) {
-        return handleBrynixDM(msg, text);
-      }
-
-      // -------------- GRUPO (GP) --------------
-      // Silenciar
-      if (isCommand && /^\/(mute\s+on|silencio\s+on)$/i.test(low)) {
-        muteMap.set(chatId, true);
-        return msg.reply(I('ok, fico em silêncio até /mute off'));
-      }
-      if (muteMap.get(chatId)) return;
-
-      // Vincular projeto
-      if (isCommand && /^\/setup/i.test(low)) {
-        const parts = text.split('|');
-        const sheetRaw = (parts[0]||'').replace(/\/setup/i,'').trim();
-        const projectName = (parts[1]||'').trim();
-        const sheetId = extractSheetId(sheetRaw);
-        if (!sheetId || !projectName) return msg.reply(`${WARN} Use: /setup <sheetId|url> | <Nome do Projeto>`);
-        linkMap.set(chatId, { sheetId, projectName });
-        return safeReply(msg, `${OK} ${B('Projeto vinculado!')}\n• Planilha: ${sheetId}\n• Nome: ${projectName}`);
-      }
-
-      const link = linkMap.get(chatId);
-      if (!link) {
-        if (isCommand && (low==='/ajuda'||low==='/help'||low==='/menu')) {
-          return msg.reply(`${WARN} Vincule o projeto antes: /setup <sheetId|url> | <Nome>`);
+        if (isCommand && /^\/ajuda|\/help|\/menu/i.test(text)) {
+          return safeReply(msg, [
+            B('Como posso ajudar?'),
+            '• Fale comigo sobre a BRYNIX (o que fazemos, ofertas, metodologia, cases).',
+            '• Para projetos, me adicione num grupo e use /setup para vincular à planilha.',
+            'Comandos técnicos: /ping, /say <texto> (áudio).'
+          ].join('\n'));
         }
-        return; // ignorar até setar /setup
+        if (isCommand && /^\/ping/i.test(text)) return msg.reply('pong 🏓');
+        if (isCommand && /^\/say/i.test(text)) {
+          const t = text.replace(/^\/say/i,'').trim() || 'Oi! Estou por aqui.';
+          const tts = require('./tts');
+          const r = await tts.synthesize(t, { voice: process.env.TTS_VOICE || 'alloy' });
+          if (!r) return msg.reply('⚠️ TTS indisponível.');
+          const media = new MessageMedia(r.mime, r.buffer.toString('base64'), 'voz.mp3');
+          return client.sendMessage(chatId, media, { sendAudioAsVoice:false });
+        }
+        const reply = await generateReply(text, { from: msg.from, pushName: msg._data?.notifyName });
+        return safeReply(msg, reply);
       }
 
-      // -------------- MENU e seleção numérica --------------
-      if (isCommand && (low==='/ajuda'||low==='/help'||low==='/menu')) {
-        await safeReply(msg, menuCard(link.projectName));
-        openMenuWindow(chatId);
-        return;
+      // 2) grupo — GP/AP
+      // silenciar
+      if (muteMap.get(chatId)) {
+        if (isCommand && /^\/mute\s*off/i.test(text)) { muteMap.delete(chatId); return msg.reply(I('voltei a falar 😉')); }
+        return; // silenciado
       }
-      // Seleção numérica quando janela aberta
-      if (isMenuOpen(chatId) && /^[1-7]$/.test(low)) {
-        const n = low.trim();
-        menuWindow.delete(chatId);
-        if (n==='1') return actSummary(msg, link);
-        if (n==='2') return actNext(msg, link);
-        if (n==='3') return actLate(msg, link);
-        if (n==='4') return safeReply(msg, '🔔 Lembrete imediato enviado (mock).'); // plugue seu scheduler se quiser
-        if (n==='5') return safeReply(msg, 'Use: /note <texto> para registrar uma nota.');
-        if (n==='6') return actWho(msg, link);
+
+      // mudo <-> desmudo
+      if (isCommand && /^\/mute\s*on/i.test(text)) { muteMap.set(chatId, true); return msg.reply(I('ok, fico em silêncio até /mute off')); }
+      if (isCommand && /^\/mute\s*off/i.test(text)) { muteMap.delete(chatId); return msg.reply(I('voltei a falar 😉')); }
+
+      // setup / bind utils
+      if (isCommand && /^\/setup/i.test(text)) return handleSetup(msg, text);
+      if (isCommand && /^\/__groupid/i.test(text)) return msg.reply(`GroupId: ${chatId}`);
+      if (isCommand && /^\/__bind/i.test(text)) {
+        const cur = linkMap.get(chatId);
+        if (!cur) return msg.reply('⚠️ Sem vínculo em memória. Use /setup.');
+        await ensureAutoBind(chatId, cur);
+        return msg.reply('✅ GroupId gravado na planilha (se não existia).');
+      }
+
+      // precisa de vínculo
+      let link = linkMap.get(chatId);
+      if (!link) {
+        // tenta autovincular se a planilha tem GroupId igual ao chat
+        if (isCommand && /^\/link\s+/i.test(text)) {
+          const sheetId = extractSheetId(text.replace(/^\/link/i,'').trim());
+          if (sheetId) {
+            const meta = await readProjectMeta(sheetId);
+            if ((meta.GroupId||'') === chatId) {
+              link = { sheetId, projectName: meta.ProjectName || 'Projeto' };
+              linkMap.set(chatId, link);
+              return msg.reply(`✅ Vínculo carregado: ${link.projectName}`);
+            }
+          }
+        }
+        // se não for /setup ou /link, orienta:
+        if (!isCommand || !/^\/setup|^\/link/i.test(text)) {
+          return msg.reply('⚠️ Grupo não vinculado. Use /setup <sheetId|url> | <Nome>  ou  /link <sheetId|url> (se a planilha já tem GroupId).');
+        }
+      }
+
+      // salva GroupId se vazio
+      if (link) ensureAutoBind(chatId, link);
+
+      // upload se houver
+      if (await handleUploadIfAny(c, msg, link)) return;
+
+      // menu rápido / números
+      const mentioned = wasBotMentioned(msg);
+      const numberOnly = /^[1-7]$/.test(text);
+      if (mentioned && !isCommand && !numberOnly) {
+        return safeReply(msg, menuCard(link.projectName));
+      }
+
+      if (numberOnly) {
+        const n = text.trim();
+        if (n==='1') return handleSummary(msg, link);
+        if (n==='2') return handleNext(msg, link);
+        if (n==='3') return handleLate(msg, link);
+        if (n==='4') return handleRemindNow(msg, link);
+        if (n==='5') return msg.reply('Digite: /note <texto>');
+        if (n==='6') return handleWho(msg, link);
         if (n==='7') { muteMap.set(chatId,true); return msg.reply(I('ok, fico em silêncio até /mute off')); }
       }
 
-      // -------------- OUTROS COMANDOS GP --------------
       if (isCommand) {
-        if (low.startsWith('/summary') || low.startsWith('/brief')) return actSummary(msg, link);
-        if (low.startsWith('/next')) return actNext(msg, link);
-        if (low.startsWith('/late')) return actLate(msg, link);
-        if (low.startsWith('/who')) return actWho(msg, link);
-
-        if (low.startsWith('/note')) {
-          const note = text.replace(/^\/note/i,'').trim();
-          if (!note) return msg.reply('Use: /note <texto>');
-          return msg.reply(`${OK} Nota registrada: ${note}`);
-        }
-
-        // ocultos também no grupo
-        if (low==='/ping') return msg.reply('pong 🏓');
-        if (low.startsWith('/__say')) {
-          const say = text.replace(/^\/__say/i,'').trim();
-          if (!say) return msg.reply('Diga algo após /__say');
-          const audio = await synthesize(say, { voice: process.env.TTS_VOICE || 'alloy' });
-          if (!audio) return msg.reply('Não consegui gerar o áudio agora.');
-          const media = new MessageMedia(audio.mime, audio.buffer.toString('base64'));
-          return client.sendMessage(msg.from, media, { sendAudioAsVoice: true });
-        }
+        if (/^\/menu/i.test(text)) return safeReply(msg, menuCard(link.projectName));
+        if (/^\/help|^\/ajuda/i.test(text)) return safeReply(msg, menuCard(link.projectName));
+        if (/^\/summary/i.test(text)) return handleSummary(msg, link);
+        if (/^\/brief/i.test(text)) return handleSummary(msg, link, { brief:true });
+        if (/^\/next/i.test(text)) return handleNext(msg, link);
+        if (/^\/late/i.test(text)) return handleLate(msg, link);
+        if (/^\/who/i.test(text)) return handleWho(msg, link);
+        if (/^\/note/i.test(text)) return handleNote(msg, link, text.replace(/^\/note/i,'').trim());
+        if (/^\/remind\s+now/i.test(text)) return handleRemindNow(msg, link);
       }
 
-      // -------------- Upload de anexos --------------
-      if (msg.hasMedia) {
-        try {
-          const res = await saveIncomingMediaToDrive(client, msg, link);
-        if (res?.url) return safeReply(msg, `${OK} Arquivo salvo em ${B(link.projectName)}.\n🔗 ${res.url}`);
-          return msg.reply(`${NO} Não consegui salvar no Drive.`);
-        } catch(e){ console.error('[DRIVE] erro upload:', e); return msg.reply(`${NO} Não consegui salvar no Drive.`); }
-      }
+      // se falou comigo naturalmente, mostro o menu
+      if (mentioned) return safeReply(msg, menuCard(link.projectName));
 
-      // -------------- Mencionei o bot? mostra menu --------------
-      if (mentionedBot(text)) {
-        await safeReply(msg, menuCard(link.projectName));
-        openMenuWindow(chatId);
-        return;
-      }
-
-    } catch(err) {
-      console.error('[WA] erro msg:', err);
-      try { await msg.reply('Dei uma engasgada técnica aqui. Pode reenviar?'); } catch(_){}
+    } catch (e) {
+      console.log('[WA] erro msg:', e?.message || e);
+      try { await msg.reply('Dei uma engasgada técnica aqui. Pode reenviar?'); } catch {}
     }
   });
 }
 
-// ------------- init & health -------------
-function initWhatsApp(app){
+/* ------------- HTTP helpers ------------- */
+
+function initWhatsApp(app) {
   client = buildClient();
   wireEvents(client);
-
-  // rotas utilitárias
-  if (app && app.get) {
-    app.get('/wa-status', async (_req,res)=>{
-      let state = currentState;
-      try { const s = await client.getState().catch(()=>null); if (s) state = s; } catch(_){}
-      res.json({ status: state, time: new Date().toISOString() });
-    });
-    app.get('/wa-qr', async (_req,res)=>{
-      try {
-        if (!lastQr) return res.status(503).send('QR ainda não gerado. Aguarde e recarregue.');
-        const png = await QRCode.toBuffer(lastQr, { type:'png', margin:1, scale:6 });
-        res.type('image/png').send(png);
-      } catch(e){ console.error(e); res.status(500).send('Erro ao gerar QR'); }
-    });
-    // healthz real
-    app.get('/healthz', (_req,res)=> res.status(200).send('ok'));
-  }
-
   client.initialize();
 
-  // watchdog
-  setInterval(async ()=>{
-    try{
+  // watchdog simples
+  setInterval(async () => {
+    try {
       const s = await client.getState().catch(()=>null);
-      if (!s || ['CONFLICT','UNPAIRED','UNLAUNCHED'].includes(s)) safeReinit(`watchdog:${s||'null'}`);
-      else if (currentState!=='ready' && s==='CONNECTED') currentState = 'ready';
-    }catch(_){ safeReinit('watchdog-error'); }
+      if (!s) console.log('[WA] state nulo (ok se reiniciou)');
+    } catch {}
   }, WATCHDOG_INTERVAL_MS);
+
+  // rotas utilitárias (healthz / qr)
+  if (app && app.get) {
+    app.get('/wa-qr', async (_req,res)=>{
+      if (!lastQr) return res.status(503).send('QR ainda não gerado.');
+      const png = await QRCode.toBuffer(lastQr, { type:'png', margin:1, scale:6 });
+      res.type('image/png').send(png);
+    });
+    app.get('/healthz', (_req,res)=> res.json({ status: currentState, binds: linkMap.size }));
+  }
+
+  // inicia scheduler (tick/60s)
+  setInterval(() => scheduler().catch(()=>{}), 60_000);
 }
 
 module.exports = { initWhatsApp, getLastQr };
